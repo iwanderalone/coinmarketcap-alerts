@@ -61,26 +61,19 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-### 4. Run with Docker
+### 4. Run with Docker Compose
 
 ```bash
-# Build
-docker build -t coinmc-alert-bot .
-
-# Run (auto-restarts on crash/reboot)
-docker run -d \
-  --name coinmc-alert-bot \
-  --restart unless-stopped \
-  --env-file .env \
-  coinmc-alert-bot
+docker compose up -d
 ```
 
-**Useful Docker commands:**
+**Useful commands:**
 
 ```bash
-docker logs -f coinmc-alert-bot      # live logs
-docker stop coinmc-alert-bot         # stop
-docker rm coinmc-alert-bot           # remove container
+docker compose logs -f    # live logs
+docker compose stop       # stop
+docker compose down       # stop and remove container
+docker compose restart    # restart after config changes
 ```
 
 ## Bot Commands
@@ -108,6 +101,7 @@ coinmarketcap-alerts/
 ├── bot.py              # Main bot logic
 ├── requirements.txt    # Python dependencies
 ├── Dockerfile          # Container image definition
+├── docker-compose.yml  # Compose service definition
 ├── .env.example        # Environment variable template
 └── tests/
     └── test_bot.py     # Unit tests
