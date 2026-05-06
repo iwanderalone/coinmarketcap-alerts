@@ -1,20 +1,23 @@
 # coinmarketcap-alerts
 
-A Telegram bot that monitors **Toncoin (TON)** via the CoinMarketCap API and sends price alerts to a group, channel, or private chat.
+A Telegram bot that monitors **Toncoin (TON)** and posts price updates, historical highs, and spike alerts to configured channels or group topics.
 
 ## Features
 
 - **Hourly price updates** — sent at the top of every hour
 - **Daily summary** — posted at midnight UTC with 24h and 7d change
-- **Spike alerts** — instant notification if TON moves ±10% within an hour (2-hour cooldown between alerts)
-- **Fixed target chat** — configure a group or channel ID so the bot posts automatically without anyone running `/start`
+- **Spike alerts** — instant alert if TON moves ±10% within an hour (2-hour cooldown)
+- **On-demand commands** — current price, 24h swing, 30-day/1-year highs, all-time high
+- **Channel-only** — commands only work in configured chats; the bot ignores private messages
+- **Multi-target** — broadcast to multiple channels or group topics simultaneously
+- **Startup health checks** — validates API keys and chat access before the bot starts
 
 ## Requirements
 
 - Python 3.13+
-- CoinMarketCap API key (free tier works)
+- CoinMarketCap API key (free basic tier works for real-time data)
 - Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Docker (optional, for containerised deployment)
+- Docker + Docker Compose (for containerised deployment)
 
 ## Setup
 
@@ -39,29 +42,9 @@ CMC_API_KEY=your_coinmarketcap_api_key
 TARGET_CHAT_ID=-1001234567890
 ```
 
-> **Finding your chat/topic ID:** Add the bot to your group/channel, then send `/chatid` — the bot replies with the exact value to paste into `TARGET_CHAT_ID`, including the topic thread ID if you run it inside a topic.  
-> For channels, the bot must be an **Admin** with "Post Messages" permission.
+See the [Target Chat ID](#target-chat-id) section below for format details.
 
-**Posting to a specific topic (forum group):**
-
-```env
-# Whole group
-TARGET_CHAT_ID=-1001234567890
-
-# Specific topic inside a group
-TARGET_CHAT_ID=-1001234567890:123
-```
-
-Run `/chatid` inside the topic to get the ready-to-paste value.
-
-### 3. Run with Python
-
-```bash
-pip install -r requirements.txt
-python bot.py
-```
-
-### 4. Run with Docker Compose
+### 3. Run with Docker Compose
 
 ```bash
 docker compose up -d
@@ -70,21 +53,55 @@ docker compose up -d
 **Useful commands:**
 
 ```bash
-docker compose logs -f    # live logs
-docker compose stop       # stop
-docker compose down       # stop and remove container
-docker compose restart    # restart after config changes
+docker compose logs -f     # live logs
+docker compose stop        # stop
+docker compose down        # stop and remove container
+docker compose restart     # restart after .env changes
 ```
 
-## Bot Commands
+### 4. Run with Python directly
+
+```bash
+pip install -r requirements.txt
+python bot.py
+```
+
+## Target Chat ID
+
+Add the bot to your group or channel, then send `/chatid` inside it — the bot replies with the exact value to paste into `TARGET_CHAT_ID`.
+
+| Format | Example | Use case |
+|--------|---------|----------|
+| Plain group or channel | `-1001234567890` | Post to the whole chat |
+| Specific topic | `-1001234567890:123` | Post to one topic thread |
+| Multiple targets | `-1001234567890:123,-1009876543210` | Post to several chats |
+
+> For **channels**, the bot must be added as an **Admin** with "Post Messages" permission.  
+> For **groups with topics**, run `/chatid` inside the specific topic to get the thread ID.
+
+## Startup Health Checks
+
+On startup the bot validates:
+
+1. **Telegram token** — calls `getMe` to confirm the token is valid
+2. **CoinMarketCap API key** — makes a live request and checks for a valid response
+3. **Target chats** — calls `getChat` on each configured chat ID to confirm the bot has access
+
+If any check fails, the bot logs the error and exits immediately rather than running silently broken.
+
+## Commands
+
+All commands work only in configured target chats. Private messages to the bot are ignored.
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Subscribe to all alerts |
-| `/stop` | Unsubscribe |
-| `/price` | Current price snapshot |
-| `/status` | Show subscription status and fixed target |
-| `/chatid` | Show the current chat's ID (useful for config) |
+| `/current` | Current price with 1h, 24h, and 7d change plus market cap |
+| `/swing` | 24h price swing — where TON opened 24h ago vs now |
+| `/top1m` | Highest TON price in the last 30 days |
+| `/top1y` | Highest TON price in the last 365 days |
+| `/ath` | All-time high price, the date it hit, and % below ATH now |
+| `/about` | Bot description and full command list |
+| `/chatid` | Show the current chat's ID and topic thread ID (works everywhere — useful for setup) |
 
 ## Environment Variables
 
@@ -92,7 +109,16 @@ docker compose restart    # restart after config changes
 |----------|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Yes | Token from @BotFather |
 | `CMC_API_KEY` | Yes | CoinMarketCap API key |
-| `TARGET_CHAT_ID` | No | Chat/group/channel ID, optionally with topic: `-1001234567890` or `-1001234567890:123` |
+| `TARGET_CHAT_ID` | Yes | One or more chat targets (see format above) |
+
+## Data Sources
+
+| Data | Source | Notes |
+|------|--------|-------|
+| Real-time price, 1h/24h/7d change, market cap | CoinMarketCap | Requires API key |
+| 30-day high, 1-year high, all-time high | CoinGecko | Free, no key needed |
+
+CoinMarketCap free tier allows ~333 calls/day. The bot uses ~288 (5-minute spike checks) leaving ~45 for on-demand commands.
 
 ## Project Structure
 
@@ -103,18 +129,22 @@ coinmarketcap-alerts/
 ├── Dockerfile          # Container image definition
 ├── docker-compose.yml  # Compose service definition
 ├── .env.example        # Environment variable template
+├── .env.test           # Placeholder env for tests
 └── tests/
     └── test_bot.py     # Unit tests
 ```
 
+## Running Tests
+
+```bash
+pip install pytest pytest-asyncio
+pytest tests/ -v
+```
+
 ## How It Works
 
-- **Spike check** runs every 5 minutes using CoinMarketCap's `percent_change_1h` field (a server-side rolling window — no local history needed)
+- **Spike check** runs every 5 minutes and reads `percent_change_1h` from CoinMarketCap — a server-side rolling window, so no local history is needed
 - **Hourly update** fires via APScheduler cron at `minute=0`
 - **Daily summary** fires at `hour=0, minute=0` UTC
-- All scheduled jobs broadcast to both `TARGET_CHAT_ID` (env) and any individual `/start` subscribers
-
-## CoinMarketCap API Usage
-
-The bot uses the `/v1/cryptocurrency/quotes/latest` endpoint.  
-At 5-minute polling: ~288 calls/day — well within the free tier (333 calls/day).
+- **Historical commands** (`/top1m`, `/top1y`, `/ath`) fetch from CoinGecko's free API on demand
+- All jobs and commands target the `TARGETS` list parsed from `TARGET_CHAT_ID` at startup

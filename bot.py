@@ -1,53 +1,113 @@
-import asyncio
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, filters
 
 load_dotenv()
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CMC_API_KEY = os.environ["CMC_API_KEY"]
-# Optional fixed target — supports plain CHAT_ID or CHAT_ID:THREAD_ID for topics
-_target_raw = os.environ.get("TARGET_CHAT_ID", "").strip()
-if _target_raw:
-    _parts = _target_raw.split(":", 1)
-    TARGET_CHAT_ID: int | None = int(_parts[0])
-    TARGET_THREAD_ID: int | None = int(_parts[1]) if len(_parts) == 2 else None
-else:
-    TARGET_CHAT_ID = None
-    TARGET_THREAD_ID = None
 
-CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-TON_ID = 11419  # CoinMarketCap ID for Toncoin
+CMC_QUOTES_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+CG_BASE = "https://api.coingecko.com/api/v3"
+TON_CMC_ID = 11419
+TON_CG_ID = "the-open-network"
 SPIKE_THRESHOLD_PCT = 10.0
 ALERT_COOLDOWN_HOURS = 2
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# --- shared state ---
-subscribers: set[int] = set()
-_alert_cooldown_until: datetime | None = None  # suppresses repeat spike alerts
+
+# ---------------------------------------------------------------------------
+# Target chat parsing
+# Supports comma-separated entries, each as CHAT_ID or CHAT_ID:THREAD_ID
+# e.g. TARGET_CHAT_ID=-1001234567890:42,-1009876543210
+# ---------------------------------------------------------------------------
+
+def _parse_targets(raw: str) -> list[tuple[int, int | None]]:
+    result = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":", 1)
+        result.append((int(parts[0]), int(parts[1]) if len(parts) == 2 else None))
+    return result
 
 
-async def fetch_ton() -> dict:
-    """Fetch the current USD quote for Toncoin from CoinMarketCap."""
+_target_raw = os.environ.get("TARGET_CHAT_ID", "").strip()
+TARGETS: list[tuple[int, int | None]] = _parse_targets(_target_raw) if _target_raw else []
+TARGET_CHAT_IDS: set[int] = {chat_id for chat_id, _ in TARGETS}
+
+# Commands restricted to configured chats only.
+# If no target is set yet, allow any non-private chat (useful during initial setup).
+if TARGET_CHAT_IDS:
+    CHAT_FILTER = filters.Chat(chat_id=list(TARGET_CHAT_IDS))
+else:
+    CHAT_FILTER = ~filters.ChatType.PRIVATE
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+_alert_cooldown_until: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Data fetching
+# ---------------------------------------------------------------------------
+
+async def fetch_ton_cmc() -> dict:
+    """Current USD quote from CoinMarketCap."""
     headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY, "Accept": "application/json"}
-    params = {"id": TON_ID, "convert": "USD"}
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(CMC_URL, headers=headers, params=params)
+        resp = await client.get(
+            CMC_QUOTES_URL, headers=headers, params={"id": TON_CMC_ID, "convert": "USD"}
+        )
         resp.raise_for_status()
-    return resp.json()["data"][str(TON_ID)]["quote"]["USD"]
+    return resp.json()["data"][str(TON_CMC_ID)]["quote"]["USD"]
 
+
+async def fetch_ton_cg_coin() -> dict:
+    """Full coin data from CoinGecko (includes ATH, % from ATH, etc.)."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{CG_BASE}/coins/{TON_CG_ID}",
+            params={
+                "localization": "false",
+                "tickers": "false",
+                "market_data": "true",
+                "community_data": "false",
+                "developer_data": "false",
+            },
+        )
+        resp.raise_for_status()
+    return resp.json()
+
+
+async def fetch_ton_cg_high(days: int) -> float:
+    """Highest price over the last N days from CoinGecko (free, no key needed)."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            f"{CG_BASE}/coins/{TON_CG_ID}/market_chart",
+            params={"vs_currency": "usd", "days": days},
+        )
+        resp.raise_for_status()
+    prices = resp.json()["prices"]  # [[timestamp_ms, price], ...]
+    return max(p[1] for p in prices)
+
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
 
 def fmt_price(price: float) -> str:
     return f"${price:,.4f}"
@@ -58,40 +118,75 @@ def fmt_pct(pct: float) -> str:
     return f"{arrow} {abs(pct):.2f}%"
 
 
+def fmt_date(iso: str) -> str:
+    return iso[:10]
+
+
+# ---------------------------------------------------------------------------
+# Broadcast
+# ---------------------------------------------------------------------------
+
 async def broadcast(app: Application, text: str) -> None:
-    # Fixed target — may include a topic thread ID
-    if TARGET_CHAT_ID is not None:
+    for chat_id, thread_id in TARGETS:
         try:
             await app.bot.send_message(
-                chat_id=TARGET_CHAT_ID,
-                message_thread_id=TARGET_THREAD_ID,
+                chat_id=chat_id,
+                message_thread_id=thread_id,
                 text=text,
                 parse_mode="HTML",
             )
         except Exception as exc:
-            log.warning("Failed to send to target %s (thread %s): %s", TARGET_CHAT_ID, TARGET_THREAD_ID, exc)
-
-    # Individual /start subscribers — no thread context
-    for chat_id in list(subscribers):
-        if chat_id == TARGET_CHAT_ID:
-            continue  # already sent above
-        try:
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-        except Exception as exc:
-            log.warning("Failed to send to %s: %s", chat_id, exc)
+            log.warning("Send failed → chat %s thread %s: %s", chat_id, thread_id, exc)
 
 
-# --- scheduled jobs ---
+# ---------------------------------------------------------------------------
+# Startup health checks
+# ---------------------------------------------------------------------------
 
-async def job_spike_check(app: Application) -> None:
-    """Runs every 5 minutes. Alerts if 1h price change exceeds ±10%."""
-    global _alert_cooldown_until
-
-    if not subscribers and TARGET_CHAT_ID is None:
-        return
+async def startup_checks(app: Application) -> None:
+    errors: list[str] = []
 
     try:
-        q = await fetch_ton()
+        me = await app.bot.get_me()
+        log.info("✓ Telegram bot: @%s", me.username)
+    except Exception as exc:
+        errors.append(f"Telegram token invalid: {exc}")
+
+    try:
+        await fetch_ton_cmc()
+        log.info("✓ CoinMarketCap API key: valid")
+    except Exception as exc:
+        errors.append(f"CoinMarketCap API error: {exc}")
+
+    for chat_id, thread_id in TARGETS:
+        try:
+            chat = await app.bot.get_chat(chat_id)
+            label = f"{chat.title or chat_id}" + (f" (topic {thread_id})" if thread_id else "")
+            log.info("✓ Target chat accessible: %s", label)
+        except Exception as exc:
+            errors.append(f"Cannot access chat {chat_id}: {exc}")
+
+    if not TARGETS:
+        log.warning("⚠ TARGET_CHAT_ID not set — bot will not post automatically")
+
+    if errors:
+        for e in errors:
+            log.error("✗ %s", e)
+        sys.exit(1)
+
+    log.info("All checks passed. Bot is ready.")
+
+
+# ---------------------------------------------------------------------------
+# Scheduled jobs
+# ---------------------------------------------------------------------------
+
+async def job_spike_check(app: Application) -> None:
+    global _alert_cooldown_until
+    if not TARGETS:
+        return
+    try:
+        q = await fetch_ton_cmc()
     except Exception as exc:
         log.error("CMC fetch error: %s", exc)
         return
@@ -101,9 +196,8 @@ async def job_spike_check(app: Application) -> None:
 
     if abs(pct_1h) < SPIKE_THRESHOLD_PCT:
         return
-
     if _alert_cooldown_until and now < _alert_cooldown_until:
-        log.info("Spike detected (%.2f%%) but cooldown active until %s", pct_1h, _alert_cooldown_until)
+        log.info("Spike %.2f%% detected — cooldown active until %s", pct_1h, _alert_cooldown_until)
         return
 
     direction = "surged" if pct_1h > 0 else "dropped"
@@ -114,22 +208,18 @@ async def job_spike_check(app: Application) -> None:
         f"Toncoin has <b>{direction} {fmt_pct(pct_1h)}</b> in the last hour!\n"
         f"Current price: <b>{fmt_price(q['price'])}</b>",
     )
-
     _alert_cooldown_until = now + timedelta(hours=ALERT_COOLDOWN_HOURS)
-    log.info("Spike alert sent (%.2f%%). Next alert allowed after %s", pct_1h, _alert_cooldown_until)
+    log.info("Spike alert sent (%.2f%%). Cooldown until %s", pct_1h, _alert_cooldown_until)
 
 
 async def job_hourly_update(app: Application) -> None:
-    """Sends a price update every hour."""
-    if not subscribers and TARGET_CHAT_ID is None:
+    if not TARGETS:
         return
-
     try:
-        q = await fetch_ton()
+        q = await fetch_ton_cmc()
     except Exception as exc:
         log.error("CMC fetch error: %s", exc)
         return
-
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
     await broadcast(
         app,
@@ -141,16 +231,13 @@ async def job_hourly_update(app: Application) -> None:
 
 
 async def job_daily_summary(app: Application) -> None:
-    """Sends a full daily summary at midnight UTC."""
-    if not subscribers and TARGET_CHAT_ID is None:
+    if not TARGETS:
         return
-
     try:
-        q = await fetch_ton()
+        q = await fetch_ton_cmc()
     except Exception as exc:
         log.error("CMC fetch error: %s", exc)
         return
-
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     await broadcast(
         app,
@@ -162,36 +249,16 @@ async def job_daily_summary(app: Application) -> None:
     )
 
 
-# --- command handlers ---
+# ---------------------------------------------------------------------------
+# Command handlers (all restricted to CHAT_FILTER except /chatid)
+# ---------------------------------------------------------------------------
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    subscribers.add(update.effective_chat.id)
-    await update.message.reply_text(
-        "✅ <b>Subscribed to Toncoin (TON) alerts!</b>\n\n"
-        "You'll receive:\n"
-        "• Hourly price updates (top of each hour)\n"
-        "• Daily summary at midnight UTC\n"
-        "• Instant alert if TON moves ±10% within an hour\n\n"
-        "Commands:\n"
-        "/price — current price snapshot\n"
-        "/status — subscription status\n"
-        "/stop — unsubscribe",
-        parse_mode="HTML",
-    )
-
-
-async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    subscribers.discard(update.effective_chat.id)
-    await update.message.reply_text("❌ Unsubscribed. Send /start to resubscribe.")
-
-
-async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_current(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        q = await fetch_ton()
+        q = await fetch_ton_cmc()
     except Exception as exc:
-        await update.message.reply_text(f"⚠️ Failed to fetch price: {exc}")
+        await update.message.reply_text(f"⚠️ Error: {exc}")
         return
-
     await update.message.reply_text(
         f"💎 <b>Toncoin (TON)</b>\n"
         f"Price: <b>{fmt_price(q['price'])}</b>\n"
@@ -203,23 +270,97 @@ async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    subbed = update.effective_chat.id in subscribers
-    if TARGET_CHAT_ID and TARGET_THREAD_ID:
-        target_line = f"Fixed target: <code>{TARGET_CHAT_ID}</code> (topic <code>{TARGET_THREAD_ID}</code>)"
-    elif TARGET_CHAT_ID:
-        target_line = f"Fixed target: <code>{TARGET_CHAT_ID}</code>"
-    else:
-        target_line = "No fixed target set"
+async def cmd_swing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        q = await fetch_ton_cmc()
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Error: {exc}")
+        return
+    price = q["price"]
+    pct_24h = q["percent_change_24h"]
+    open_price = price / (1 + pct_24h / 100)
+    emoji = "📈" if pct_24h >= 0 else "📉"
     await update.message.reply_text(
-        f"{'✅ You are subscribed.' if subbed else '❌ Not subscribed — send /start.'}\n"
-        f"Individual subscribers: {len(subscribers)}\n"
-        f"{target_line}",
+        f"{emoji} <b>TON 24h Swing</b>\n"
+        f"Open (24h ago): {fmt_price(open_price)}\n"
+        f"Now: <b>{fmt_price(price)}</b>\n"
+        f"Change: <b>{fmt_pct(pct_24h)}</b>",
         parse_mode="HTML",
     )
 
 
+async def cmd_top1m(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text("⏳ Fetching 30-day high…")
+    try:
+        high = await fetch_ton_cg_high(30)
+    except Exception as exc:
+        await msg.edit_text(f"⚠️ Error: {exc}")
+        return
+    await msg.edit_text(
+        f"📅 <b>TON — 30-Day High</b>\n"
+        f"Highest price in last 30 days: <b>{fmt_price(high)}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_top1y(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text("⏳ Fetching 1-year high…")
+    try:
+        high = await fetch_ton_cg_high(365)
+    except Exception as exc:
+        await msg.edit_text(f"⚠️ Error: {exc}")
+        return
+    await msg.edit_text(
+        f"📆 <b>TON — 1-Year High</b>\n"
+        f"Highest price in last 365 days: <b>{fmt_price(high)}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_ath(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text("⏳ Fetching all-time high…")
+    try:
+        data = await fetch_ton_cg_coin()
+        md = data["market_data"]
+        ath = md["ath"]["usd"]
+        ath_date = fmt_date(md["ath_date"]["usd"])
+        pct_from_ath = md["ath_change_percentage"]["usd"]
+    except Exception as exc:
+        await msg.edit_text(f"⚠️ Error: {exc}")
+        return
+    await msg.edit_text(
+        f"🏆 <b>TON All-Time High</b>\n"
+        f"ATH: <b>{fmt_price(ath)}</b>\n"
+        f"Date: {ath_date}\n"
+        f"Current vs ATH: {fmt_pct(pct_from_ath)}",
+        parse_mode="HTML",
+    )
+
+
+ABOUT_TEXT = (
+    "🤖 <b>Toncoin (TON) Alert Bot</b>\n"
+    "Monitors Toncoin via CoinMarketCap and posts updates to this channel.\n\n"
+    "<b>On-demand commands</b>\n"
+    "/current — current price with 1h, 24h and 7d change\n"
+    "/swing — 24h price swing: where it opened vs now\n"
+    "/top1m — highest TON price in the last 30 days\n"
+    "/top1y — highest TON price in the last 365 days\n"
+    "/ath — all-time high price and the date it hit\n"
+    "/about — show this message\n\n"
+    "<b>Automatic updates</b>\n"
+    "• Hourly price update at the top of each hour\n"
+    "• Daily summary every midnight UTC\n"
+    "• Spike alert if TON moves ±10% within 1 hour (2h cooldown)\n\n"
+    "Data: CoinMarketCap (real-time) · CoinGecko (historical)"
+)
+
+
+async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(ABOUT_TEXT, parse_mode="HTML")
+
+
 async def cmd_chatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unrestricted — useful during initial setup to find a chat/topic ID."""
     chat = update.effective_chat
     thread_id = update.message.message_thread_id
     target_value = f"{chat.id}:{thread_id}" if thread_id else str(chat.id)
@@ -229,20 +370,35 @@ async def cmd_chatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Type: {chat.type}\n"
         f"Title: {chat.title or '—'}\n"
         + (f"Topic thread ID: <code>{thread_id}</code>\n" if thread_id else "")
-        + f"\nUse in <code>TARGET_CHAT_ID</code>:\n<code>{target_value}</code>",
+        + f"\nSet in <code>TARGET_CHAT_ID</code>:\n<code>{target_value}</code>",
         parse_mode="HTML",
     )
 
 
-# --- entrypoint ---
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(startup_checks)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("status", cmd_status))
+    # Channel-only commands
+    for name, handler in [
+        ("current", cmd_current),
+        ("swing", cmd_swing),
+        ("top1m", cmd_top1m),
+        ("top1y", cmd_top1y),
+        ("ath", cmd_ath),
+        ("about", cmd_about),
+    ]:
+        app.add_handler(CommandHandler(name, handler, filters=CHAT_FILTER))
+
+    # Setup helper — works everywhere
     app.add_handler(CommandHandler("chatid", cmd_chatid))
 
     scheduler = AsyncIOScheduler(timezone="UTC")
@@ -251,7 +407,7 @@ def main() -> None:
     scheduler.add_job(job_daily_summary, "cron", hour=0, minute=0, args=[app])
     scheduler.start()
 
-    log.info("Bot started.")
+    log.info("Bot started. Targets: %s", TARGETS or "none configured")
     app.run_polling(drop_pending_updates=True)
 
 
