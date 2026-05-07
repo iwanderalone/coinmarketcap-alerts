@@ -21,13 +21,11 @@ CMC_QUOTES_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/lat
 CG_BASE = "https://api.coingecko.com/api/v3"
 TON_CMC_ID = 11419
 TON_CG_ID = "the-open-network"
-SPIKE_THRESHOLD_PCT = 10.0
-ALERT_COOLDOWN_HOURS = 2
-
-# Hourly swing alert — compares our captured price snapshots each hour
-_swing_pct_raw = os.environ.get("HOURLY_SWING_PCT", "10").strip()
-HOURLY_SWING_PCT: float = float(_swing_pct_raw) if _swing_pct_raw else 10.0
-HOURLY_SWING_TAG: str = os.environ.get("HOURLY_SWING_TAG", "").strip()  # e.g. @username or @user1,@user2
+# All thresholds and cooldowns are configurable via .env
+SPIKE_THRESHOLD_PCT: float = float(os.environ.get("SPIKE_THRESHOLD_PCT", "10"))
+SPIKE_COOLDOWN_HOURS: float = float(os.environ.get("SPIKE_COOLDOWN_HOURS", "2"))
+HOURLY_SWING_PCT: float = float(os.environ.get("HOURLY_SWING_PCT", "10"))
+HOURLY_SWING_TAG: str = os.environ.get("HOURLY_SWING_TAG", "").strip()
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -286,7 +284,7 @@ async def job_spike_check(app: Application) -> None:
         f"Toncoin has <b>{direction} {fmt_pct(pct_1h)}</b> in the last hour!\n"
         f"Current price: <b>{fmt_price(price)}</b>",
     )
-    _alert_cooldown_until = now + timedelta(hours=ALERT_COOLDOWN_HOURS)
+    _alert_cooldown_until = now + timedelta(hours=SPIKE_COOLDOWN_HOURS)
     log.info("Spike alert sent (%.2f%%). Cooldown until %s", pct_1h, _alert_cooldown_until)
 
 
@@ -522,9 +520,9 @@ ABOUT_TEXT = (
     "/about — show this message\n"
     "/chatid — show this chat's ID and topic thread ID\n\n"
     "<b>Automatic updates</b>\n"
-    "• Hourly price update — tags you if price swung more than the configured % since last hour\n"
-    "• Daily summary every midnight UTC\n"
-    "• Spike alert if TON moves ±10% within 1 hour (2h cooldown)\n"
+    f"• Hourly price update — tags if swing exceeds {HOURLY_SWING_PCT}% since last hour\n"
+    f"• Daily summary every midnight UTC\n"
+    f"• Spike alert if TON moves ±{SPIKE_THRESHOLD_PCT}% in 1h ({SPIKE_COOLDOWN_HOURS}h cooldown)\n"
     "• Price alert check every 5 minutes\n\n"
     "Data: CoinMarketCap (real-time) · CoinGecko (historical)"
 )

@@ -6,7 +6,7 @@ A Telegram bot that monitors **Toncoin (TON)** and posts price updates, alerts, 
 
 - **Hourly price updates** — sent at the top of every hour, with swing alert if price moved more than X% since last hour
 - **Daily summary** — posted at midnight UTC with 24h and 7d change
-- **Spike alerts** — instant alert if TON moves ±10% within an hour (CMC rolling window, 2-hour cooldown)
+- **Spike alerts** — instant alert if TON moves beyond the configured threshold within an hour (CMC rolling window, configurable cooldown)
 - **Price alerts** — set a target price with `/alert 2.88`; fires when TON crosses it and tags configured users
 - **On-demand commands** — current price, 24h swing, 30-day/1-year highs, all-time high
 - **Channel-only** — commands only work in configured chats; the bot ignores private messages
@@ -119,7 +119,9 @@ All commands work only in configured target chats. Private messages to the bot a
 | `TELEGRAM_BOT_TOKEN` | Yes | — | Token from @BotFather |
 | `CMC_API_KEY` | Yes | — | CoinMarketCap API key |
 | `TARGET_CHAT_ID` | Yes | — | One or more chat targets (see format above) |
-| `HOURLY_SWING_PCT` | No | `10` | % threshold for the hourly swing tag alert |
+| `SPIKE_THRESHOLD_PCT` | No | `10` | % move (CMC 1h rolling) that triggers a spike alert |
+| `SPIKE_COOLDOWN_HOURS` | No | `2` | Hours to wait before the next spike alert can fire |
+| `HOURLY_SWING_PCT` | No | `10` | % move between hourly snapshots that triggers the tag |
 | `HOURLY_SWING_TAG` | No | — | Who to tag on swing/price alerts, e.g. `@username` or `@user1 @user2` |
 
 ## Data Sources
@@ -155,7 +157,7 @@ pytest tests/ -v
 
 ## How It Works
 
-- **Spike + alert check** runs every 5 minutes: fetches price once, checks CMC's `percent_change_1h` for ±10% spikes, and checks all active user-set price alerts against the current price
+- **Spike + alert check** runs every 5 minutes: fetches price once, checks CMC's `percent_change_1h` against `SPIKE_THRESHOLD_PCT`, then checks all user-set price alerts; a `SPIKE_COOLDOWN_HOURS` guard prevents repeat spike alerts
 - **Hourly update** fires at `minute=0`: broadcasts price, compares to the previous hourly snapshot, and tags `HOURLY_SWING_TAG` if the move exceeds `HOURLY_SWING_PCT`
 - **Daily summary** fires at `hour=0, minute=0` UTC
 - **Price alerts** are stored in `alerts.json` and survive restarts; direction (above/below) is inferred at creation time from the current price; alerts are one-shot and removed after firing
