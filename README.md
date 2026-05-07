@@ -1,12 +1,13 @@
 # coinmarketcap-alerts
 
-A Telegram bot that monitors **Toncoin (TON)** and posts price updates, historical highs, and spike alerts to configured channels or group topics.
+A Telegram bot that monitors **Toncoin (TON)** and posts price updates, alerts, and historical data to configured channels or group topics.
 
 ## Features
 
-- **Hourly price updates** — sent at the top of every hour
+- **Hourly price updates** — sent at the top of every hour, with swing alert if price moved more than X% since last hour
 - **Daily summary** — posted at midnight UTC with 24h and 7d change
-- **Spike alerts** — instant alert if TON moves ±10% within an hour (2-hour cooldown)
+- **Spike alerts** — instant alert if TON moves ±10% within an hour (CMC rolling window, 2-hour cooldown)
+- **Price alerts** — set a target price with `/alert 2.88`; fires when TON crosses it and tags configured users
 - **On-demand commands** — current price, 24h swing, 30-day/1-year highs, all-time high
 - **Channel-only** — commands only work in configured chats; the bot ignores private messages
 - **Multi-target** — broadcast to multiple channels or group topics simultaneously
@@ -40,13 +41,18 @@ Edit `.env`:
 TELEGRAM_BOT_TOKEN=7123456789:AAF...your_token...
 CMC_API_KEY=your_coinmarketcap_api_key
 TARGET_CHAT_ID=-1001234567890
+HOURLY_SWING_PCT=10
+HOURLY_SWING_TAG=@yourusername
 ```
 
-See the [Target Chat ID](#target-chat-id) section below for format details.
+See the [Target Chat ID](#target-chat-id) and [Environment Variables](#environment-variables) sections for full details.
 
 ### 3. Run with Docker Compose
 
+Create `alerts.json` before the first run so Docker can mount it as a file volume:
+
 ```bash
+echo "[]" > alerts.json
 docker compose up -d
 ```
 
@@ -100,16 +106,21 @@ All commands work only in configured target chats. Private messages to the bot a
 | `/top1m` | Highest TON price in the last 30 days |
 | `/top1y` | Highest TON price in the last 365 days |
 | `/ath` | All-time high price, the date it hit, and % below ATH now |
+| `/alert 2.88` | Set a price alert — fires when TON reaches $2.88 (direction auto-detected) |
+| `/alerts` | List all active price alerts |
+| `/delalert 2.88` | Remove the alert at $2.88 |
 | `/about` | Bot description and full command list |
 | `/chatid` | Show the current chat's ID and topic thread ID (works everywhere — useful for setup) |
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Yes | Token from @BotFather |
-| `CMC_API_KEY` | Yes | CoinMarketCap API key |
-| `TARGET_CHAT_ID` | Yes | One or more chat targets (see format above) |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Yes | — | Token from @BotFather |
+| `CMC_API_KEY` | Yes | — | CoinMarketCap API key |
+| `TARGET_CHAT_ID` | Yes | — | One or more chat targets (see format above) |
+| `HOURLY_SWING_PCT` | No | `10` | % threshold for the hourly swing tag alert |
+| `HOURLY_SWING_TAG` | No | — | Who to tag on swing/price alerts, e.g. `@username` or `@user1 @user2` |
 
 ## Data Sources
 
@@ -118,7 +129,7 @@ All commands work only in configured target chats. Private messages to the bot a
 | Real-time price, 1h/24h/7d change, market cap | CoinMarketCap | Requires API key |
 | 30-day high, 1-year high, all-time high | CoinGecko | Free, no key needed |
 
-CoinMarketCap free tier allows ~333 calls/day. The bot uses ~288 (5-minute spike checks) leaving ~45 for on-demand commands.
+CoinMarketCap free tier allows ~333 calls/day. The bot uses ~288 (5-minute spike + price-alert checks) leaving ~45 for on-demand commands.
 
 ## Project Structure
 
@@ -130,6 +141,7 @@ coinmarketcap-alerts/
 ├── docker-compose.yml  # Compose service definition
 ├── .env.example        # Environment variable template
 ├── .env.test           # Placeholder env for tests
+├── alerts.json         # Active price alerts (runtime, gitignored)
 └── tests/
     └── test_bot.py     # Unit tests
 ```
@@ -143,8 +155,9 @@ pytest tests/ -v
 
 ## How It Works
 
-- **Spike check** runs every 5 minutes and reads `percent_change_1h` from CoinMarketCap — a server-side rolling window, so no local history is needed
-- **Hourly update** fires via APScheduler cron at `minute=0`
+- **Spike + alert check** runs every 5 minutes: fetches price once, checks CMC's `percent_change_1h` for ±10% spikes, and checks all active user-set price alerts against the current price
+- **Hourly update** fires at `minute=0`: broadcasts price, compares to the previous hourly snapshot, and tags `HOURLY_SWING_TAG` if the move exceeds `HOURLY_SWING_PCT`
 - **Daily summary** fires at `hour=0, minute=0` UTC
+- **Price alerts** are stored in `alerts.json` and survive restarts; direction (above/below) is inferred at creation time from the current price; alerts are one-shot and removed after firing
 - **Historical commands** (`/top1m`, `/top1y`, `/ath`) fetch from CoinGecko's free API on demand
 - All jobs and commands target the `TARGETS` list parsed from `TARGET_CHAT_ID` at startup
