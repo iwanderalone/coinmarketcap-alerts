@@ -21,6 +21,11 @@ TON_CG_ID = "the-open-network"
 SPIKE_THRESHOLD_PCT = 10.0
 ALERT_COOLDOWN_HOURS = 2
 
+# Hourly swing alert — compares our captured price snapshots each hour
+_swing_pct_raw = os.environ.get("HOURLY_SWING_PCT", "10").strip()
+HOURLY_SWING_PCT: float = float(_swing_pct_raw) if _swing_pct_raw else 10.0
+HOURLY_SWING_TAG: str = os.environ.get("HOURLY_SWING_TAG", "").strip()  # e.g. @username or @user1,@user2
+
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
@@ -59,6 +64,7 @@ else:
 # ---------------------------------------------------------------------------
 
 _alert_cooldown_until: datetime | None = None
+_last_hourly_price: float | None = None  # price captured at last hourly tick
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +219,7 @@ async def job_spike_check(app: Application) -> None:
 
 
 async def job_hourly_update(app: Application) -> None:
+    global _last_hourly_price
     if not TARGETS:
         return
     try:
@@ -220,13 +227,30 @@ async def job_hourly_update(app: Application) -> None:
     except Exception as exc:
         log.error("CMC fetch error: %s", exc)
         return
+
+    price = q["price"]
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    # Check swing against our own last captured price
+    swing_line = ""
+    tag_line = ""
+    if _last_hourly_price is not None:
+        swing_pct = (price - _last_hourly_price) / _last_hourly_price * 100
+        swing_line = f"\nHourly swing: {fmt_pct(swing_pct)}"
+        if abs(swing_pct) >= HOURLY_SWING_PCT and HOURLY_SWING_TAG:
+            tag_line = f"\n{HOURLY_SWING_TAG}"
+            log.info("Hourly swing %.2f%% exceeded threshold — tagging %s", swing_pct, HOURLY_SWING_TAG)
+
+    _last_hourly_price = price
+
     await broadcast(
         app,
         f"⏰ <b>TON Hourly Update</b> — {now}\n"
-        f"Price: <b>{fmt_price(q['price'])}</b>\n"
+        f"Price: <b>{fmt_price(price)}</b>\n"
         f"1h change: {fmt_pct(q['percent_change_1h'])}\n"
-        f"24h change: {fmt_pct(q['percent_change_24h'])}",
+        f"24h change: {fmt_pct(q['percent_change_24h'])}"
+        f"{swing_line}"
+        f"{tag_line}",
     )
 
 
