@@ -1,7 +1,10 @@
+import json
 import logging
 import os
 import sys
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -57,6 +60,39 @@ if TARGET_CHAT_IDS:
     CHAT_FILTER = filters.Chat(chat_id=list(TARGET_CHAT_IDS))
 else:
     CHAT_FILTER = ~filters.ChatType.PRIVATE
+
+
+# ---------------------------------------------------------------------------
+# Price alerts — persistent, stored in alerts.json
+# ---------------------------------------------------------------------------
+
+ALERTS_FILE = Path("alerts.json")
+
+
+@dataclass
+class PriceAlert:
+    target: float
+    direction: str  # "above" | "below"
+
+
+def _load_alerts() -> list[PriceAlert]:
+    if not ALERTS_FILE.exists():
+        return []
+    try:
+        return [PriceAlert(**a) for a in json.loads(ALERTS_FILE.read_text())]
+    except Exception as exc:
+        log.warning("Could not load alerts.json: %s", exc)
+        return []
+
+
+def _save_alerts(alerts: list[PriceAlert]) -> None:
+    try:
+        ALERTS_FILE.write_text(json.dumps([asdict(a) for a in alerts], indent=2))
+    except Exception as exc:
+        log.warning("Could not save alerts.json: %s", exc)
+
+
+_price_alerts: list[PriceAlert] = _load_alerts()
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +223,37 @@ async def startup_checks(app: Application) -> None:
 # Scheduled jobs
 # ---------------------------------------------------------------------------
 
+async def _check_price_alerts(app: Application, price: float) -> None:
+    """Fire and remove any price alerts that the current price has crossed."""
+    global _price_alerts
+    if not _price_alerts:
+        return
+
+    triggered = [
+        a for a in _price_alerts
+        if (a.direction == "above" and price >= a.target)
+        or (a.direction == "below" and price <= a.target)
+    ]
+    if not triggered:
+        return
+
+    _price_alerts = [a for a in _price_alerts if a not in triggered]
+    _save_alerts(_price_alerts)
+
+    tag = f"\n{HOURLY_SWING_TAG}" if HOURLY_SWING_TAG else ""
+    for alert in triggered:
+        emoji = "🎯"
+        label = "reached" if alert.direction == "above" else "dropped to"
+        await broadcast(
+            app,
+            f"{emoji} <b>TON Price Alert</b>\n"
+            f"Target {label}: <b>{fmt_price(alert.target)}</b>\n"
+            f"Current price: <b>{fmt_price(price)}</b>"
+            f"{tag}",
+        )
+        log.info("Price alert fired: target %s (%s), current %s", alert.target, alert.direction, price)
+
+
 async def job_spike_check(app: Application) -> None:
     global _alert_cooldown_until
     if not TARGETS:
@@ -197,9 +264,14 @@ async def job_spike_check(app: Application) -> None:
         log.error("CMC fetch error: %s", exc)
         return
 
+    price = q["price"]
     pct_1h = q["percent_change_1h"]
     now = datetime.now(timezone.utc)
 
+    # Check user-set price alerts
+    await _check_price_alerts(app, price)
+
+    # Check ±10% spike
     if abs(pct_1h) < SPIKE_THRESHOLD_PCT:
         return
     if _alert_cooldown_until and now < _alert_cooldown_until:
@@ -212,7 +284,7 @@ async def job_spike_check(app: Application) -> None:
         app,
         f"{emoji} <b>TON Price Alert</b>\n"
         f"Toncoin has <b>{direction} {fmt_pct(pct_1h)}</b> in the last hour!\n"
-        f"Current price: <b>{fmt_price(q['price'])}</b>",
+        f"Current price: <b>{fmt_price(price)}</b>",
     )
     _alert_cooldown_until = now + timedelta(hours=ALERT_COOLDOWN_HOURS)
     log.info("Spike alert sent (%.2f%%). Cooldown until %s", pct_1h, _alert_cooldown_until)
@@ -361,6 +433,78 @@ async def cmd_ath(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_alert(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.message.reply_text("Usage: /alert <price>  e.g. /alert 2.88")
+        return
+    try:
+        target = float(ctx.args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid price. Example: /alert 2.88")
+        return
+
+    try:
+        q = await fetch_ton_cmc()
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Could not fetch current price: {exc}")
+        return
+
+    current = q["price"]
+    if abs(current - target) < 0.00001:
+        await update.message.reply_text("⚠️ Target price is the same as the current price.")
+        return
+
+    direction = "above" if target > current else "below"
+
+    # Replace any existing alert at the same target price
+    _price_alerts[:] = [a for a in _price_alerts if a.target != target]
+    _price_alerts.append(PriceAlert(target=target, direction=direction))
+    _save_alerts(_price_alerts)
+
+    label = "rises to" if direction == "above" else "drops to"
+    await update.message.reply_text(
+        f"🎯 Alert set: notify when TON {label} <b>{fmt_price(target)}</b>\n"
+        f"Current price: {fmt_price(current)}",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _price_alerts:
+        await update.message.reply_text("No active price alerts. Set one with /alert <price>")
+        return
+    lines = []
+    for i, a in enumerate(_price_alerts, 1):
+        label = "≥" if a.direction == "above" else "≤"
+        lines.append(f"{i}. {label} <b>{fmt_price(a.target)}</b>")
+    await update.message.reply_text(
+        f"🎯 <b>Active price alerts ({len(_price_alerts)})</b>\n"
+        + "\n".join(lines)
+        + "\n\nRemove one with /delalert <price>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_delalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.message.reply_text("Usage: /delalert <price>  e.g. /delalert 2.88")
+        return
+    try:
+        target = float(ctx.args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid price. Example: /delalert 2.88")
+        return
+
+    before = len(_price_alerts)
+    _price_alerts[:] = [a for a in _price_alerts if a.target != target]
+    if len(_price_alerts) == before:
+        await update.message.reply_text(f"No alert found at {fmt_price(target)}.")
+        return
+
+    _save_alerts(_price_alerts)
+    await update.message.reply_text(f"✅ Alert at {fmt_price(target)} removed.")
+
+
 ABOUT_TEXT = (
     "🤖 <b>Toncoin (TON) Alert Bot</b>\n"
     "Monitors Toncoin via CoinMarketCap and posts updates to this channel.\n\n"
@@ -371,6 +515,10 @@ ABOUT_TEXT = (
     "/top1y — highest TON price in the last 365 days\n"
     "/ath — all-time high price and the date it hit\n"
     "/about — show this message\n\n"
+    "<b>Price alerts</b>\n"
+    "/alert 2.88 — notify when TON reaches $2.88 (above or below current)\n"
+    "/alerts — list all active price alerts\n"
+    "/delalert 2.88 — remove the alert at $2.88\n\n"
     "<b>Automatic updates</b>\n"
     "• Hourly price update at the top of each hour\n"
     "• Daily summary every midnight UTC\n"
@@ -418,6 +566,9 @@ def main() -> None:
         ("top1m", cmd_top1m),
         ("top1y", cmd_top1y),
         ("ath", cmd_ath),
+        ("alert", cmd_alert),
+        ("alerts", cmd_alerts),
+        ("delalert", cmd_delalert),
         ("about", cmd_about),
     ]:
         app.add_handler(CommandHandler(name, handler, filters=CHAT_FILTER))

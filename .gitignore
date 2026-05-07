@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Runtime state
+alerts.json
+
 # Claude Code
 .claude/
 
