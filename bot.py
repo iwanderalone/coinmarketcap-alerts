@@ -1,11 +1,12 @@
 import logging
 import sys
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, filters
 
 from config import config
 from database import db
 from providers.ai_research import generate_ai_research
+from providers.news import fetch_news_items, generate_ai_news_summary
 from providers.stocks import fetch_market_status
 from services.market_service import fetch_quote
 from services.scheduler import fmt_pct, fmt_price, start_scheduler
@@ -18,6 +19,21 @@ if config.target_chat_ids:
     CHAT_FILTER = filters.Chat(chat_id=list(config.target_chat_ids))
 else:
     CHAT_FILTER = ~filters.ChatType.PRIVATE
+
+
+def get_quote_keyboard(symbol: str, asset_type: str) -> InlineKeyboardMarkup:
+    """Generate interactive buttons for quote response."""
+    keyboard = [
+        [
+            InlineKeyboardButton("🤖 AI Research", callback_data=f"res:{symbol}"),
+            InlineKeyboardButton("📰 News", callback_data=f"news:{asset_type}:{symbol}"),
+        ],
+        [
+            InlineKeyboardButton("⭐ +Favorite", callback_data=f"fav:{asset_type}:{symbol}"),
+            InlineKeyboardButton("🎯 +Alert", callback_data=f"alert_prompt:{symbol}"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +64,8 @@ async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if quote.fifty_two_week_high and quote.fifty_two_week_low:
             text += f"\n52w Range: {fmt_price(quote.fifty_two_week_low)} - {fmt_price(quote.fifty_two_week_high)}"
 
-        await update.message.reply_text(text, parse_mode="HTML")
+        reply_markup = get_quote_keyboard(quote.symbol, quote.asset_type)
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
     except Exception as exc:
         await update.message.reply_text(f"⚠️ Could not fetch quote for '{symbol}': {exc}")
 
@@ -80,7 +97,6 @@ async def cmd_fav(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("⚠️ Asset type must be 'stock' or 'crypto'.")
             return
 
-        # Validate symbol by fetching quote
         try:
             quote = await fetch_quote(symbol, asset_type=asset_type)
         except Exception as exc:
@@ -139,6 +155,125 @@ async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append(f"⚠️ <b>{item.symbol}</b>: Fetch error ({exc})")
 
     await msg.edit_text("⭐ <b>Live Watchlist Summary:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manage investor portfolio holdings. Usage: /port or /port add <stock|crypto> <symbol> <qty> <buy_price>"""
+    chat_id = update.effective_chat.id
+
+    if ctx.args:
+        subcmd = ctx.args[0].lower()
+        if subcmd == "add":
+            if len(ctx.args) < 5:
+                await update.message.reply_text("Usage: /port add <stock|crypto> <symbol> <quantity> <buy_price>\nExample: /port add stock AAPL 10 210.50")
+                return
+            asset_type = ctx.args[1].lower()
+            symbol = ctx.args[2].strip().upper()
+            try:
+                qty = float(ctx.args[3].replace(",", "."))
+                buy_price = float(ctx.args[4].replace(",", "."))
+            except ValueError:
+                await update.message.reply_text("⚠️ Invalid quantity or buy price.")
+                return
+
+            if asset_type not in ("stock", "crypto"):
+                await update.message.reply_text("⚠️ Asset type must be 'stock' or 'crypto'.")
+                return
+
+            try:
+                q = await fetch_quote(symbol, asset_type)
+                symbol = q.symbol
+            except Exception as exc:
+                await update.message.reply_text(f"⚠️ Could not verify symbol '{symbol}': {exc}")
+                return
+
+            await db.add_portfolio_item(chat_id, symbol, asset_type, qty, buy_price)
+            await update.message.reply_text(
+                f"💼 Portfolio Updated!\nAdded <b>{qty} {symbol}</b> @ <b>{fmt_price(buy_price)}</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        elif subcmd in ("del", "remove"):
+            if len(ctx.args) < 2:
+                await update.message.reply_text("Usage: /port del <symbol>")
+                return
+            symbol = ctx.args[1].strip().upper()
+            removed = await db.remove_portfolio_item(chat_id, symbol)
+            if removed:
+                await update.message.reply_text(f"✅ Removed <b>{symbol}</b> from portfolio.", parse_mode="HTML")
+            else:
+                await update.message.reply_text(f"⚠️ <b>{symbol}</b> not found in portfolio.", parse_mode="HTML")
+            return
+
+    # View Portfolio
+    items = await db.get_portfolio(chat_id)
+    if not items:
+        await update.message.reply_text(
+            "💼 <b>Your Portfolio is empty.</b>\n"
+            "Add positions using:\n"
+            "<code>/port add stock AAPL 10 210.50</code>\n"
+            "<code>/port add crypto BTC 0.5 65000</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    msg = await update.message.reply_text("⏳ Calculating portfolio performance & PnL…")
+    total_val = 0.0
+    total_cost = 0.0
+    lines = []
+
+    for item in items:
+        try:
+            q = await fetch_quote(item.symbol, item.asset_type)
+            curr_val = q.price * item.quantity
+            cost_basis = item.buy_price * item.quantity
+            pnl = curr_val - cost_basis
+            pnl_pct = ((curr_val - cost_basis) / cost_basis * 100) if cost_basis > 0 else 0.0
+
+            total_val += curr_val
+            total_cost += cost_basis
+
+            pnl_icon = "🟢" if pnl >= 0 else "🔴"
+            lines.append(
+                f"{pnl_icon} <b>{item.symbol}</b> ({item.quantity:g} shares/coins)\n"
+                f"   Value: <b>{fmt_price(curr_val)}</b> | PnL: <b>{pnl:+.2f} ({pnl_pct:+.2f}%)</b>\n"
+                f"   Avg Cost: {fmt_price(item.buy_price)} → Now: {fmt_price(q.price)}"
+            )
+        except Exception as exc:
+            lines.append(f"⚠️ <b>{item.symbol}</b>: Error fetching data ({exc})")
+
+    total_pnl = total_val - total_cost
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
+    overall_icon = "🟢" if total_pnl >= 0 else "🔴"
+
+    header = (
+        f"💼 <b>Investor Portfolio Summary</b>\n"
+        f"Total Value: <b>{fmt_price(total_val)}</b>\n"
+        f"Total Cost: {fmt_price(total_cost)}\n"
+        f"Total PnL: {overall_icon} <b>${total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)</b>\n\n"
+        f"<b>Holdings Breakdown:</b>\n"
+    )
+
+    await msg.edit_text(header + "\n\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch financial news & AI summary. Usage: /news <symbol>"""
+    if not ctx.args:
+        await update.message.reply_text("Usage: /news <symbol>  (e.g., /news AAPL or /news BTC)")
+        return
+
+    symbol = ctx.args[0].strip().upper()
+    msg = await update.message.reply_text(f"📰 <i>Fetching news & generating AI summary for <b>{symbol}</b>…</i>", parse_mode="HTML")
+
+    try:
+        quote = await fetch_quote(symbol)
+        news_items = await fetch_news_items(quote.symbol, quote.asset_type)
+        summary = await generate_ai_news_summary(quote, news_items)
+        await msg.edit_text(summary, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as exc:
+        await msg.edit_text(f"⚠️ Error fetching news for {symbol}: {exc}")
 
 
 async def cmd_alert(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -264,15 +399,71 @@ async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠️ Error checking market status: {exc}")
 
 
+async def handle_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle interactive button clicks."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = update.effective_chat.id
+
+    parts = data.split(":")
+    action = parts[0]
+
+    if action == "res":
+        symbol = parts[1]
+        await query.message.reply_text(f"🤖 <i>Generating AI Research Briefing for <b>{symbol}</b>…</i>", parse_mode="HTML")
+        try:
+            quote = await fetch_quote(symbol)
+            research_text = await generate_ai_research(quote)
+            await query.message.reply_text(research_text, parse_mode="HTML")
+        except Exception as exc:
+            await query.message.reply_text(f"⚠️ Error generating research for {symbol}: {exc}")
+
+    elif action == "news":
+        asset_type = parts[1]
+        symbol = parts[2]
+        await query.message.reply_text(f"📰 <i>Fetching news for <b>{symbol}</b>…</i>", parse_mode="HTML")
+        try:
+            quote = await fetch_quote(symbol, asset_type)
+            news_items = await fetch_news_items(symbol, asset_type)
+            summary = await generate_ai_news_summary(quote, news_items)
+            await query.message.reply_text(summary, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception as exc:
+            await query.message.reply_text(f"⚠️ Error fetching news for {symbol}: {exc}")
+
+    elif action == "fav":
+        asset_type = parts[1]
+        symbol = parts[2]
+        added = await db.add_to_watchlist(chat_id, symbol, asset_type)
+        if added:
+            await query.message.reply_text(f"⭐ Added <b>{symbol}</b> [{asset_type.upper()}] to your favorites!", parse_mode="HTML")
+        else:
+            await query.message.reply_text(f"⚠️ <b>{symbol}</b> is already in your favorites.", parse_mode="HTML")
+
+    elif action == "alert_prompt":
+        symbol = parts[1]
+        await query.message.reply_text(
+            f"🎯 <b>Set Alert for {symbol}</b>\n"
+            f"Type: <code>/alert {symbol} &lt;target_price&gt;</code>\n"
+            f"Example: <code>/alert {symbol} 250</code>",
+            parse_mode="HTML",
+        )
+
+
 async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show bot features and user command guide."""
     about_text = (
         "🤖 <b>Investor Multi-Asset Telegram Bot</b>\n"
-        "Monitors US Stocks and Cryptocurrencies with AI research & alerts.\n\n"
+        "Monitors US Stocks and Cryptocurrencies with Portfolio Tracking, News Intelligence, and AI Research.\n\n"
         "<b>Market & Prices</b>\n"
-        "• <code>/p AAPL</code> or <code>/p BTC</code> — Get real-time price quote\n"
+        "• <code>/p AAPL</code> or <code>/p BTC</code> — Live price quote with interactive buttons\n"
         "• <code>/market</code> — US stock market status & indices\n"
-        "• <code>/watchlist</code> — Live updates for your favorites\n\n"
+        "• <code>/watchlist</code> — Live updates for your favorites\n"
+        "• <code>/news NVDA</code> — Financial news & AI news summary\n\n"
+        "<b>Portfolio Tracker</b>\n"
+        "• <code>/port</code> — View portfolio value, PnL & holdings breakdown\n"
+        "• <code>/port add stock AAPL 10 210.50</code> — Add/update holding\n"
+        "• <code>/port del AAPL</code> — Remove holding\n\n"
         "<b>Favorites Watchlist</b>\n"
         "• <code>/fav add stock AAPL</code> — Add US stock to favorites\n"
         "• <code>/fav add crypto BTC</code> — Add crypto to favorites\n"
@@ -288,8 +479,7 @@ async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• US Market Open Alert (09:30 AM ET, Mon-Fri)\n"
         "• US Market Close Alert (04:00 PM ET, Mon-Fri)\n"
         "• Drastic Price Movement Alerts (Spikes/Drops)\n"
-        "• Daily Digest Summary (Midnight UTC)\n"
-        "• Custom Price Target Trigger Notifications"
+        "• Daily Digest Summary (Midnight UTC)"
     )
     await update.message.reply_text(about_text, parse_mode="HTML")
 
@@ -347,6 +537,9 @@ def main() -> None:
         ("price", cmd_price),
         ("fav", cmd_fav),
         ("watchlist", cmd_watchlist),
+        ("port", cmd_portfolio),
+        ("portfolio", cmd_portfolio),
+        ("news", cmd_news),
         ("alert", cmd_alert),
         ("alerts", cmd_alerts),
         ("delalert", cmd_delalert),
@@ -358,13 +551,14 @@ def main() -> None:
     for name, handler in commands:
         app.add_handler(CommandHandler(name, handler, filters=CHAT_FILTER))
 
-    # Helper command available everywhere
+    # Helper command & Callback Query Handler for Interactive Buttons
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
 
     # Start Background Scheduler
     start_scheduler(app)
 
-    log.info("Starting Investor Telegram Bot...")
+    log.info("Starting Investor Telegram Bot with Portfolio, News & Interactive Buttons...")
     app.run_polling(drop_pending_updates=True)
 
 

@@ -30,6 +30,16 @@ class PriceAlert:
     created_at: str
 
 
+@dataclass
+class PortfolioItem:
+    chat_id: int
+    symbol: str
+    asset_type: str
+    quantity: float
+    buy_price: float
+    added_at: str
+
+
 class Database:
     def __init__(self, db_path: Path = config.db_path):
         self.db_path = db_path
@@ -55,6 +65,17 @@ class Database:
                     target_price REAL NOT NULL,
                     direction TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS portfolios (
+                    chat_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    asset_type TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    buy_price REAL NOT NULL,
+                    added_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, symbol)
                 )
             """)
             await db.commit()
@@ -191,6 +212,50 @@ class Database:
             async with db.execute("SELECT id, chat_id, symbol, asset_type, target_price, direction, created_at FROM price_alerts") as cursor:
                 rows = await cursor.fetchall()
                 return [PriceAlert(**dict(row)) for row in rows]
+
+    # -------------------------------------------------------------------
+    # Portfolio Methods
+    # -------------------------------------------------------------------
+
+    async def add_portfolio_item(self, chat_id: int, symbol: str, asset_type: str, quantity: float, buy_price: float) -> PortfolioItem:
+        symbol_upper = symbol.strip().upper()
+        now_str = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO portfolios (chat_id, symbol, asset_type, quantity, buy_price, added_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, symbol) DO UPDATE SET quantity = ?, buy_price = ?, added_at = ?",
+                (chat_id, symbol_upper, asset_type, quantity, buy_price, now_str, quantity, buy_price, now_str),
+            )
+            await db.commit()
+            return PortfolioItem(
+                chat_id=chat_id,
+                symbol=symbol_upper,
+                asset_type=asset_type,
+                quantity=quantity,
+                buy_price=buy_price,
+                added_at=now_str,
+            )
+
+    async def remove_portfolio_item(self, chat_id: int, symbol: str) -> bool:
+        symbol_upper = symbol.strip().upper()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM portfolios WHERE chat_id = ? AND symbol = ?",
+                (chat_id, symbol_upper),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_portfolio(self, chat_id: int) -> List[PortfolioItem]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT chat_id, symbol, asset_type, quantity, buy_price, added_at FROM portfolios WHERE chat_id = ?",
+                (chat_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [PortfolioItem(**dict(row)) for row in rows]
 
 
 db = Database()

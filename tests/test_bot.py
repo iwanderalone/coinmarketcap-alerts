@@ -85,3 +85,28 @@ async def test_database_price_alerts(tmp_path):
     removed = await test_db.remove_alert_by_target(123, "BTC", 100000.0)
     assert removed is True
     assert len(await test_db.get_alerts_for_chat(123)) == 0
+
+
+@pytest.mark.asyncio
+async def test_database_portfolio(tmp_path):
+    db_file = tmp_path / "test_port.db"
+    test_db = Database(db_file)
+    await test_db.init()
+
+    item = await test_db.add_portfolio_item(
+        chat_id=123,
+        symbol="AAPL",
+        asset_type="stock",
+        quantity=10.0,
+        buy_price=210.5,
+    )
+    assert item.symbol == "AAPL"
+    assert item.quantity == 10.0
+
+    port = await test_db.get_portfolio(123)
+    assert len(port) == 1
+    assert port[0].buy_price == 210.5
+
+    removed = await test_db.remove_portfolio_item(123, "AAPL")
+    assert removed is True
+    assert len(await test_db.get_portfolio(123)) == 0
