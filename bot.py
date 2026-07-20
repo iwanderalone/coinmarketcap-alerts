@@ -1,589 +1,370 @@
-import json
 import logging
-import os
 import sys
-from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-import httpx
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, filters
 
-load_dotenv()
-
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CMC_API_KEY = os.environ["CMC_API_KEY"]
-
-CMC_QUOTES_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-CG_BASE = "https://api.coingecko.com/api/v3"
-TON_CMC_ID = 11419
-TON_CG_ID = "the-open-network"
-# All thresholds and cooldowns are configurable via .env
-SPIKE_THRESHOLD_PCT: float = float(os.environ.get("SPIKE_THRESHOLD_PCT", "10"))
-SPIKE_COOLDOWN_HOURS: float = float(os.environ.get("SPIKE_COOLDOWN_HOURS", "2"))
-HOURLY_SWING_PCT: float = float(os.environ.get("HOURLY_SWING_PCT", "10"))
-HOURLY_SWING_TAG: str = os.environ.get("HOURLY_SWING_TAG", "").strip()
+from config import config
+from database import db
+from providers.ai_research import generate_ai_research
+from providers.stocks import fetch_market_status
+from services.market_service import fetch_quote
+from services.scheduler import fmt_pct, fmt_price, start_scheduler
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Target chat parsing
-# Supports comma-separated entries, each as CHAT_ID or CHAT_ID:THREAD_ID
-# e.g. TARGET_CHAT_ID=-1001234567890:42,-1009876543210
-# ---------------------------------------------------------------------------
-
-def _parse_targets(raw: str) -> list[tuple[int, int | None]]:
-    result = []
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        parts = entry.split(":", 1)
-        result.append((int(parts[0]), int(parts[1]) if len(parts) == 2 else None))
-    return result
-
-
-_target_raw = os.environ.get("TARGET_CHAT_ID", "").strip()
-TARGETS: list[tuple[int, int | None]] = _parse_targets(_target_raw) if _target_raw else []
-TARGET_CHAT_IDS: set[int] = {chat_id for chat_id, _ in TARGETS}
-
-# Commands restricted to configured chats only.
-# If no target is set yet, allow any non-private chat (useful during initial setup).
-if TARGET_CHAT_IDS:
-    CHAT_FILTER = filters.Chat(chat_id=list(TARGET_CHAT_IDS))
+# Configure chat filter
+if config.target_chat_ids:
+    CHAT_FILTER = filters.Chat(chat_id=list(config.target_chat_ids))
 else:
     CHAT_FILTER = ~filters.ChatType.PRIVATE
 
 
 # ---------------------------------------------------------------------------
-# Price alerts — persistent, stored in alerts.json
+# Command Handlers
 # ---------------------------------------------------------------------------
 
-ALERTS_FILE = Path("alerts.json")
+async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Get price quote for any crypto or stock symbol. Usage: /p AAPL or /p BTC"""
+    if not ctx.args:
+        await update.message.reply_text("Usage: /p <symbol>  (e.g., /p AAPL or /p BTC)")
+        return
 
-
-@dataclass
-class PriceAlert:
-    target: float
-    direction: str  # "above" | "below"
-
-
-def _load_alerts() -> list[PriceAlert]:
-    if not ALERTS_FILE.exists():
-        return []
+    symbol = ctx.args[0].strip().upper()
     try:
-        return [PriceAlert(**a) for a in json.loads(ALERTS_FILE.read_text())]
+        quote = await fetch_quote(symbol)
+        mcap_str = f"${quote.market_cap:,.0f}" if quote.market_cap else "N/A"
+        vol_str = f"${quote.volume_24h:,.0f}" if quote.volume_24h else "N/A"
+
+        text = (
+            f"📊 <b>{quote.name} ({quote.symbol})</b> [{quote.asset_type.upper()}]\n"
+            f"Price: <b>{fmt_price(quote.price)}</b>\n"
+            f"24h Change: <b>{fmt_pct(quote.change_24h_pct)}</b>\n"
+            f"Market Cap: {mcap_str}\n"
+            f"24h Volume: {vol_str}"
+        )
+        if quote.pe_ratio:
+            text += f"\nP/E Ratio: {quote.pe_ratio:.2f}"
+        if quote.fifty_two_week_high and quote.fifty_two_week_low:
+            text += f"\n52w Range: {fmt_price(quote.fifty_two_week_low)} - {fmt_price(quote.fifty_two_week_high)}"
+
+        await update.message.reply_text(text, parse_mode="HTML")
     except Exception as exc:
-        log.warning("Could not load alerts.json: %s", exc)
-        return []
+        await update.message.reply_text(f"⚠️ Could not fetch quote for '{symbol}': {exc}")
 
 
-def _save_alerts(alerts: list[PriceAlert]) -> None:
-    try:
-        ALERTS_FILE.write_text(json.dumps([asdict(a) for a in alerts], indent=2))
-    except Exception as exc:
-        log.warning("Could not save alerts.json: %s", exc)
-
-
-_price_alerts: list[PriceAlert] = _load_alerts()
-
-
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
-
-_alert_cooldown_until: datetime | None = None
-_last_hourly_price: float | None = None  # price captured at last hourly tick
-
-
-# ---------------------------------------------------------------------------
-# Data fetching
-# ---------------------------------------------------------------------------
-
-async def fetch_ton_cmc() -> dict:
-    """Current USD quote from CoinMarketCap."""
-    headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY, "Accept": "application/json"}
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            CMC_QUOTES_URL, headers=headers, params={"id": TON_CMC_ID, "convert": "USD"}
+async def cmd_fav(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manage favorite assets. Usage: /fav add <stock|crypto> <symbol>, /fav del <symbol>, /fav list"""
+    chat_id = update.effective_chat.id
+    if not ctx.args:
+        await update.message.reply_text(
+            "<b>Favorites Commands:</b>\n"
+            "• <code>/fav add stock AAPL</code> — Add US stock\n"
+            "• <code>/fav add crypto BTC</code> — Add crypto\n"
+            "• <code>/fav del AAPL</code> — Remove item\n"
+            "• <code>/fav list</code> — View favorites",
+            parse_mode="HTML",
         )
-        resp.raise_for_status()
-    return resp.json()["data"][str(TON_CMC_ID)]["quote"]["USD"]
+        return
 
+    subcmd = ctx.args[0].lower()
 
-async def fetch_ton_cg_coin() -> dict:
-    """Full coin data from CoinGecko (includes ATH, % from ATH, etc.)."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"{CG_BASE}/coins/{TON_CG_ID}",
-            params={
-                "localization": "false",
-                "tickers": "false",
-                "market_data": "true",
-                "community_data": "false",
-                "developer_data": "false",
-            },
-        )
-        resp.raise_for_status()
-    return resp.json()
+    if subcmd == "add":
+        if len(ctx.args) < 3:
+            await update.message.reply_text("Usage: /fav add <stock|crypto> <symbol>")
+            return
+        asset_type = ctx.args[1].lower()
+        symbol = ctx.args[2].strip().upper()
 
+        if asset_type not in ("stock", "crypto"):
+            await update.message.reply_text("⚠️ Asset type must be 'stock' or 'crypto'.")
+            return
 
-async def fetch_ton_cg_high(days: int) -> float:
-    """Highest price over the last N days from CoinGecko (free, no key needed)."""
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(
-            f"{CG_BASE}/coins/{TON_CG_ID}/market_chart",
-            params={"vs_currency": "usd", "days": days},
-        )
-        resp.raise_for_status()
-    prices = resp.json()["prices"]  # [[timestamp_ms, price], ...]
-    return max(p[1] for p in prices)
-
-
-# ---------------------------------------------------------------------------
-# Formatting
-# ---------------------------------------------------------------------------
-
-def fmt_price(price: float) -> str:
-    return f"${price:,.4f}"
-
-
-def fmt_pct(pct: float) -> str:
-    arrow = "▲" if pct >= 0 else "▼"
-    return f"{arrow} {abs(pct):.2f}%"
-
-
-def fmt_date(iso: str) -> str:
-    return iso[:10]
-
-
-# ---------------------------------------------------------------------------
-# Broadcast
-# ---------------------------------------------------------------------------
-
-async def broadcast(app: Application, text: str) -> None:
-    for chat_id, thread_id in TARGETS:
+        # Validate symbol by fetching quote
         try:
-            await app.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                text=text,
+            quote = await fetch_quote(symbol, asset_type=asset_type)
+        except Exception as exc:
+            await update.message.reply_text(f"⚠️ Invalid symbol or data fetch error: {exc}")
+            return
+
+        success = await db.add_to_watchlist(chat_id, quote.symbol, asset_type)
+        if success:
+            await update.message.reply_text(
+                f"✅ Added <b>{quote.name} ({quote.symbol})</b> [{asset_type.upper()}] to your favorites!",
                 parse_mode="HTML",
             )
-        except Exception as exc:
-            log.warning("Send failed → chat %s thread %s: %s", chat_id, thread_id, exc)
+        else:
+            await update.message.reply_text(f"⚠️ <b>{quote.symbol}</b> is already in your favorites.", parse_mode="HTML")
+
+    elif subcmd in ("del", "remove", "delete"):
+        if len(ctx.args) < 2:
+            await update.message.reply_text("Usage: /fav del <symbol>")
+            return
+        symbol = ctx.args[1].strip().upper()
+        removed = await db.remove_from_watchlist(chat_id, symbol)
+        if removed:
+            await update.message.reply_text(f"✅ Removed <b>{symbol}</b> from favorites.", parse_mode="HTML")
+        else:
+            await update.message.reply_text(f"⚠️ Symbol <b>{symbol}</b> was not found in your favorites.", parse_mode="HTML")
+
+    elif subcmd == "list":
+        items = await db.get_watchlist(chat_id)
+        if not items:
+            await update.message.reply_text("Your favorites list is currently empty. Add items with <code>/fav add <stock|crypto> <symbol></code>", parse_mode="HTML")
+            return
+        lines = []
+        for i, item in enumerate(items, 1):
+            lines.append(f"{i}. <b>{item.symbol}</b> [{item.asset_type.upper()}]")
+        await update.message.reply_text("⭐ <b>Your Favorites Watchlist:</b>\n" + "\n".join(lines), parse_mode="HTML")
+    else:
+        await update.message.reply_text("Unknown subcommand. Use <code>/fav</code> for usage info.", parse_mode="HTML")
 
 
-# ---------------------------------------------------------------------------
-# Startup health checks
-# ---------------------------------------------------------------------------
+async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show prices and 24h performance for all items in chat's favorites."""
+    chat_id = update.effective_chat.id
+    items = await db.get_watchlist(chat_id)
+    if not items:
+        await update.message.reply_text("No favorites set yet. Add with <code>/fav add stock AAPL</code> or <code>/fav add crypto BTC</code>.", parse_mode="HTML")
+        return
 
-async def startup_checks(app: Application) -> None:
-    errors: list[str] = []
-
-    try:
-        me = await app.bot.get_me()
-        log.info("✓ Telegram bot: @%s", me.username)
-    except Exception as exc:
-        errors.append(f"Telegram token invalid: {exc}")
-
-    try:
-        await fetch_ton_cmc()
-        log.info("✓ CoinMarketCap API key: valid")
-    except Exception as exc:
-        errors.append(f"CoinMarketCap API error: {exc}")
-
-    for chat_id, thread_id in TARGETS:
+    msg = await update.message.reply_text("⏳ Fetching live watchlist performance…")
+    lines = []
+    for item in items:
         try:
-            chat = await app.bot.get_chat(chat_id)
-            label = f"{chat.title or chat_id}" + (f" (topic {thread_id})" if thread_id else "")
-            log.info("✓ Target chat accessible: %s", label)
+            q = await fetch_quote(item.symbol, item.asset_type)
+            icon = "📈" if q.change_24h_pct >= 0 else "📉"
+            lines.append(f"{icon} <b>{q.symbol}</b> ({q.asset_type.upper()}): <b>{fmt_price(q.price)}</b> ({fmt_pct(q.change_24h_pct)})")
         except Exception as exc:
-            errors.append(f"Cannot access chat {chat_id}: {exc}")
+            lines.append(f"⚠️ <b>{item.symbol}</b>: Fetch error ({exc})")
 
-    if not TARGETS:
-        log.warning("⚠ TARGET_CHAT_ID not set — bot will not post automatically")
-
-    if errors:
-        for e in errors:
-            log.error("✗ %s", e)
-        sys.exit(1)
-
-    log.info("All checks passed. Bot is ready.")
-
-
-# ---------------------------------------------------------------------------
-# Scheduled jobs
-# ---------------------------------------------------------------------------
-
-async def _check_price_alerts(app: Application, price: float) -> None:
-    """Fire and remove any price alerts that the current price has crossed."""
-    global _price_alerts
-    if not _price_alerts:
-        return
-
-    triggered = [
-        a for a in _price_alerts
-        if (a.direction == "above" and price >= a.target)
-        or (a.direction == "below" and price <= a.target)
-    ]
-    if not triggered:
-        return
-
-    _price_alerts = [a for a in _price_alerts if a not in triggered]
-    _save_alerts(_price_alerts)
-
-    tag = f"\n{HOURLY_SWING_TAG}" if HOURLY_SWING_TAG else ""
-    for alert in triggered:
-        emoji = "🎯"
-        label = "reached" if alert.direction == "above" else "dropped to"
-        await broadcast(
-            app,
-            f"{emoji} <b>TON Price Alert</b>\n"
-            f"Target {label}: <b>{fmt_price(alert.target)}</b>\n"
-            f"Current price: <b>{fmt_price(price)}</b>"
-            f"{tag}",
-        )
-        log.info("Price alert fired: target %s (%s), current %s", alert.target, alert.direction, price)
-
-
-async def job_spike_check(app: Application) -> None:
-    global _alert_cooldown_until
-    if not TARGETS:
-        return
-    try:
-        q = await fetch_ton_cmc()
-    except Exception as exc:
-        log.error("CMC fetch error: %s", exc)
-        return
-
-    price = q["price"]
-    pct_1h = q["percent_change_1h"]
-    now = datetime.now(timezone.utc)
-
-    # Check user-set price alerts
-    await _check_price_alerts(app, price)
-
-    # Check ±10% spike
-    if abs(pct_1h) < SPIKE_THRESHOLD_PCT:
-        return
-    if _alert_cooldown_until and now < _alert_cooldown_until:
-        log.info("Spike %.2f%% detected — cooldown active until %s", pct_1h, _alert_cooldown_until)
-        return
-
-    direction = "surged" if pct_1h > 0 else "dropped"
-    emoji = "🚀" if pct_1h > 0 else "🔻"
-    await broadcast(
-        app,
-        f"{emoji} <b>TON Price Alert</b>\n"
-        f"Toncoin has <b>{direction} {fmt_pct(pct_1h)}</b> in the last hour!\n"
-        f"Current price: <b>{fmt_price(price)}</b>",
-    )
-    _alert_cooldown_until = now + timedelta(hours=SPIKE_COOLDOWN_HOURS)
-    log.info("Spike alert sent (%.2f%%). Cooldown until %s", pct_1h, _alert_cooldown_until)
-
-
-async def job_hourly_update(app: Application) -> None:
-    global _last_hourly_price
-    if not TARGETS:
-        return
-    try:
-        q = await fetch_ton_cmc()
-    except Exception as exc:
-        log.error("CMC fetch error: %s", exc)
-        return
-
-    price = q["price"]
-    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-    # Check swing against our own last captured price
-    swing_line = ""
-    tag_line = ""
-    if _last_hourly_price is not None:
-        swing_pct = (price - _last_hourly_price) / _last_hourly_price * 100
-        swing_line = f"\nHourly swing: {fmt_pct(swing_pct)}"
-        if abs(swing_pct) >= HOURLY_SWING_PCT and HOURLY_SWING_TAG:
-            tag_line = f"\n{HOURLY_SWING_TAG}"
-            log.info("Hourly swing %.2f%% exceeded threshold — tagging %s", swing_pct, HOURLY_SWING_TAG)
-
-    _last_hourly_price = price
-
-    await broadcast(
-        app,
-        f"⏰ <b>TON Hourly Update</b> — {now}\n"
-        f"Price: <b>{fmt_price(price)}</b>\n"
-        f"1h change: {fmt_pct(q['percent_change_1h'])}\n"
-        f"24h change: {fmt_pct(q['percent_change_24h'])}"
-        f"{swing_line}"
-        f"{tag_line}",
-    )
-
-
-async def job_daily_summary(app: Application) -> None:
-    if not TARGETS:
-        return
-    try:
-        q = await fetch_ton_cmc()
-    except Exception as exc:
-        log.error("CMC fetch error: %s", exc)
-        return
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    await broadcast(
-        app,
-        f"📊 <b>TON Daily Summary</b> — {today}\n"
-        f"Price: <b>{fmt_price(q['price'])}</b>\n"
-        f"24h change: {fmt_pct(q['percent_change_24h'])}\n"
-        f"7d change: {fmt_pct(q['percent_change_7d'])}\n"
-        f"Market cap: ${q['market_cap']:,.0f}",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Command handlers (all restricted to CHAT_FILTER except /chatid)
-# ---------------------------------------------------------------------------
-
-async def cmd_current(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        q = await fetch_ton_cmc()
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Error: {exc}")
-        return
-    await update.message.reply_text(
-        f"💎 <b>Toncoin (TON)</b>\n"
-        f"Price: <b>{fmt_price(q['price'])}</b>\n"
-        f"1h: {fmt_pct(q['percent_change_1h'])}\n"
-        f"24h: {fmt_pct(q['percent_change_24h'])}\n"
-        f"7d: {fmt_pct(q['percent_change_7d'])}\n"
-        f"Market cap: ${q['market_cap']:,.0f}",
-        parse_mode="HTML",
-    )
-
-
-async def cmd_swing(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        q = await fetch_ton_cmc()
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Error: {exc}")
-        return
-    price = q["price"]
-    pct_24h = q["percent_change_24h"]
-    open_price = price / (1 + pct_24h / 100)
-    emoji = "📈" if pct_24h >= 0 else "📉"
-    await update.message.reply_text(
-        f"{emoji} <b>TON 24h Swing</b>\n"
-        f"Open (24h ago): {fmt_price(open_price)}\n"
-        f"Now: <b>{fmt_price(price)}</b>\n"
-        f"Change: <b>{fmt_pct(pct_24h)}</b>",
-        parse_mode="HTML",
-    )
-
-
-async def cmd_top1m(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text("⏳ Fetching 30-day high…")
-    try:
-        high = await fetch_ton_cg_high(30)
-    except Exception as exc:
-        await msg.edit_text(f"⚠️ Error: {exc}")
-        return
-    await msg.edit_text(
-        f"📅 <b>TON — 30-Day High</b>\n"
-        f"Highest price in last 30 days: <b>{fmt_price(high)}</b>",
-        parse_mode="HTML",
-    )
-
-
-async def cmd_top1y(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text("⏳ Fetching 1-year high…")
-    try:
-        high = await fetch_ton_cg_high(365)
-    except Exception as exc:
-        await msg.edit_text(f"⚠️ Error: {exc}")
-        return
-    await msg.edit_text(
-        f"📆 <b>TON — 1-Year High</b>\n"
-        f"Highest price in last 365 days: <b>{fmt_price(high)}</b>",
-        parse_mode="HTML",
-    )
-
-
-async def cmd_ath(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text("⏳ Fetching all-time high…")
-    try:
-        data = await fetch_ton_cg_coin()
-        md = data["market_data"]
-        ath = md["ath"]["usd"]
-        ath_date = fmt_date(md["ath_date"]["usd"])
-        pct_from_ath = md["ath_change_percentage"]["usd"]
-    except Exception as exc:
-        await msg.edit_text(f"⚠️ Error: {exc}")
-        return
-    await msg.edit_text(
-        f"🏆 <b>TON All-Time High</b>\n"
-        f"ATH: <b>{fmt_price(ath)}</b>\n"
-        f"Date: {ath_date}\n"
-        f"Current vs ATH: {fmt_pct(pct_from_ath)}",
-        parse_mode="HTML",
-    )
+    await msg.edit_text("⭐ <b>Live Watchlist Summary:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_alert(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ctx.args:
-        await update.message.reply_text("Usage: /alert <price>  e.g. /alert 2.88")
+    """Set price alert. Usage: /alert <symbol> <price>"""
+    if len(ctx.args) < 2:
+        await update.message.reply_text("Usage: /alert <symbol> <target_price>  (e.g., /alert AAPL 230 or /alert BTC 95000)")
         return
+
+    symbol = ctx.args[0].strip().upper()
     try:
-        target = float(ctx.args[0].replace(",", "."))
+        target_price = float(ctx.args[1].replace(",", "."))
     except ValueError:
-        await update.message.reply_text("⚠️ Invalid price. Example: /alert 2.88")
+        await update.message.reply_text("⚠️ Invalid price. Example: /alert AAPL 230")
         return
 
     try:
-        q = await fetch_ton_cmc()
+        quote = await fetch_quote(symbol)
     except Exception as exc:
-        await update.message.reply_text(f"⚠️ Could not fetch current price: {exc}")
+        await update.message.reply_text(f"⚠️ Could not fetch current price for {symbol}: {exc}")
         return
 
-    current = q["price"]
-    if abs(current - target) < 0.00001:
-        await update.message.reply_text("⚠️ Target price is the same as the current price.")
+    current = quote.price
+    if abs(current - target_price) < 0.0001:
+        await update.message.reply_text("⚠️ Target price is the same as current price.")
         return
 
-    direction = "above" if target > current else "below"
-
-    # Replace any existing alert at the same target price
-    _price_alerts[:] = [a for a in _price_alerts if a.target != target]
-    _price_alerts.append(PriceAlert(target=target, direction=direction))
-    _save_alerts(_price_alerts)
+    direction = "above" if target_price > current else "below"
+    chat_id = update.effective_chat.id
+    
+    await db.add_alert(
+        chat_id=chat_id,
+        symbol=quote.symbol,
+        asset_type=quote.asset_type,
+        target_price=target_price,
+        direction=direction,
+    )
 
     label = "rises to" if direction == "above" else "drops to"
     await update.message.reply_text(
-        f"🎯 Alert set: notify when TON {label} <b>{fmt_price(target)}</b>\n"
+        f"🎯 Alert set: notify when <b>{quote.symbol}</b> {label} <b>{fmt_price(target_price)}</b>\n"
         f"Current price: {fmt_price(current)}",
         parse_mode="HTML",
     )
 
 
 async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _price_alerts:
-        await update.message.reply_text("No active price alerts. Set one with /alert <price>")
+    """List active price alerts."""
+    chat_id = update.effective_chat.id
+    alerts = await db.get_alerts_for_chat(chat_id)
+    if not alerts:
+        await update.message.reply_text("No active price alerts. Set one with /alert <symbol> <price>")
         return
+
     lines = []
-    for i, a in enumerate(_price_alerts, 1):
+    for i, a in enumerate(alerts, 1):
         label = "≥" if a.direction == "above" else "≤"
-        lines.append(f"{i}. {label} <b>{fmt_price(a.target)}</b>")
+        lines.append(f"{i}. <b>{a.symbol}</b> [{a.asset_type.upper()}] {label} <b>{fmt_price(a.target_price)}</b>")
+
     await update.message.reply_text(
-        f"🎯 <b>Active price alerts ({len(_price_alerts)})</b>\n"
+        f"🎯 <b>Active Price Alerts ({len(alerts)})</b>\n"
         + "\n".join(lines)
-        + "\n\nRemove one with /delalert <price>",
+        + "\n\nRemove with /delalert <symbol> <price>",
         parse_mode="HTML",
     )
 
 
 async def cmd_delalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ctx.args:
-        await update.message.reply_text("Usage: /delalert <price>  e.g. /delalert 2.88")
+    """Remove price alert. Usage: /delalert <symbol> <price>"""
+    if len(ctx.args) < 2:
+        await update.message.reply_text("Usage: /delalert <symbol> <price>")
         return
+
+    symbol = ctx.args[0].strip().upper()
     try:
-        target = float(ctx.args[0].replace(",", "."))
+        target_price = float(ctx.args[1].replace(",", "."))
     except ValueError:
-        await update.message.reply_text("⚠️ Invalid price. Example: /delalert 2.88")
+        await update.message.reply_text("⚠️ Invalid price.")
         return
 
-    before = len(_price_alerts)
-    _price_alerts[:] = [a for a in _price_alerts if a.target != target]
-    if len(_price_alerts) == before:
-        await update.message.reply_text(f"No alert found at {fmt_price(target)}.")
+    chat_id = update.effective_chat.id
+    removed = await db.remove_alert_by_target(chat_id, symbol, target_price)
+    if removed:
+        await update.message.reply_text(f"✅ Alert for <b>{symbol}</b> at {fmt_price(target_price)} removed.", parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"No alert found for <b>{symbol}</b> at {fmt_price(target_price)}.", parse_mode="HTML")
+
+
+async def cmd_research(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generate AI research briefing for a stock or crypto. Usage: /research <symbol>"""
+    if not ctx.args:
+        await update.message.reply_text("Usage: /research <symbol>  (e.g., /research NVDA or /research ETH)")
         return
 
-    _save_alerts(_price_alerts)
-    await update.message.reply_text(f"✅ Alert at {fmt_price(target)} removed.")
+    symbol = ctx.args[0].strip().upper()
+    msg = await update.message.reply_text(f"🤖 <i>Generating AI Research Briefing for <b>{symbol}</b>…</i>", parse_mode="HTML")
+
+    try:
+        quote = await fetch_quote(symbol)
+        research_text = await generate_ai_research(quote)
+        await msg.edit_text(research_text, parse_mode="HTML")
+    except Exception as exc:
+        await msg.edit_text(f"⚠️ Error generating AI research: {exc}")
 
 
-ABOUT_TEXT = (
-    "🤖 <b>Toncoin (TON) Alert Bot</b>\n"
-    "Monitors Toncoin via CoinMarketCap and posts updates to this channel.\n\n"
-    "<b>Price commands</b>\n"
-    "/current — current price with 1h, 24h and 7d change\n"
-    "/swing — 24h price swing: where it opened vs now\n"
-    "/top1m — highest TON price in the last 30 days\n"
-    "/top1y — highest TON price in the last 365 days\n"
-    "/ath — all-time high price and the date it hit\n\n"
-    "<b>Price alerts</b>\n"
-    "/alert 2.88 — notify when TON reaches $2.88 (direction auto-detected)\n"
-    "/alerts — list all active price alerts\n"
-    "/delalert 2.88 — remove the alert at $2.88\n\n"
-    "<b>Other</b>\n"
-    "/about — show this message\n"
-    "/chatid — show this chat's ID and topic thread ID\n\n"
-    "<b>Automatic updates</b>\n"
-    f"• Hourly price update — tags if swing exceeds {HOURLY_SWING_PCT}% since last hour\n"
-    f"• Daily summary every midnight UTC\n"
-    f"• Spike alert if TON moves ±{SPIKE_THRESHOLD_PCT}% in 1h ({SPIKE_COOLDOWN_HOURS}h cooldown)\n"
-    "• Price alert check every 5 minutes\n\n"
-    "Data: CoinMarketCap (real-time) · CoinGecko (historical)"
-)
+async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check US stock market status (Open/Closed) and major index trends."""
+    try:
+        status = await fetch_market_status()
+        status_emoji = "🟢" if status.is_open else "🔴"
+        
+        sp_line = f"• S&P 500: <b>{status.sp500_price:,.2f}</b> ({fmt_pct(status.sp500_change_pct or 0.0)})" if status.sp500_price else ""
+        nasdaq_line = f"• Nasdaq: <b>{status.nasdaq_price:,.2f}</b> ({fmt_pct(status.nasdaq_change_pct or 0.0)})" if status.nasdaq_price else ""
+        
+        text = (
+            f"🏛️ <b>US Stock Market Status</b>\n"
+            f"Status: {status_emoji} <b>{status.status_text}</b>\n\n"
+            f"<b>Major Indices:</b>\n"
+            f"{sp_line}\n"
+            f"{nasdaq_line}"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Error checking market status: {exc}")
 
 
 async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(ABOUT_TEXT, parse_mode="HTML")
+    """Show bot features and user command guide."""
+    about_text = (
+        "🤖 <b>Investor Multi-Asset Telegram Bot</b>\n"
+        "Monitors US Stocks and Cryptocurrencies with AI research & alerts.\n\n"
+        "<b>Market & Prices</b>\n"
+        "• <code>/p AAPL</code> or <code>/p BTC</code> — Get real-time price quote\n"
+        "• <code>/market</code> — US stock market status & indices\n"
+        "• <code>/watchlist</code> — Live updates for your favorites\n\n"
+        "<b>Favorites Watchlist</b>\n"
+        "• <code>/fav add stock AAPL</code> — Add US stock to favorites\n"
+        "• <code>/fav add crypto BTC</code> — Add crypto to favorites\n"
+        "• <code>/fav del AAPL</code> — Remove from favorites\n"
+        "• <code>/fav list</code> — View favorites list\n\n"
+        "<b>Price Alerts</b>\n"
+        "• <code>/alert NVDA 140</code> — Alert when NVDA reaches $140\n"
+        "• <code>/alerts</code> — List active price alerts\n"
+        "• <code>/delalert NVDA 140</code> — Delete price alert\n\n"
+        "<b>AI Investor Research</b>\n"
+        "• <code>/research TSLA</code> — Generate AI research report\n\n"
+        "<b>Automated Notifications</b>\n"
+        "• US Market Open Alert (09:30 AM ET, Mon-Fri)\n"
+        "• US Market Close Alert (04:00 PM ET, Mon-Fri)\n"
+        "• Drastic Price Movement Alerts (Spikes/Drops)\n"
+        "• Daily Digest Summary (Midnight UTC)\n"
+        "• Custom Price Target Trigger Notifications"
+    )
+    await update.message.reply_text(about_text, parse_mode="HTML")
 
 
 async def cmd_chatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Unrestricted — useful during initial setup to find a chat/topic ID."""
+    """Setup helper command to inspect Chat and Thread ID."""
     chat = update.effective_chat
     thread_id = update.message.message_thread_id
     target_value = f"{chat.id}:{thread_id}" if thread_id else str(chat.id)
     await update.message.reply_text(
-        f"<b>Chat info</b>\n"
+        f"<b>Chat Info</b>\n"
         f"ID: <code>{chat.id}</code>\n"
         f"Type: {chat.type}\n"
         f"Title: {chat.title or '—'}\n"
-        + (f"Topic thread ID: <code>{thread_id}</code>\n" if thread_id else "")
-        + f"\nSet in <code>TARGET_CHAT_ID</code>:\n<code>{target_value}</code>",
+        + (f"Topic Thread ID: <code>{thread_id}</code>\n" if thread_id else "")
+        + f"\nAdd to <code>TARGET_CHAT_ID</code>:\n<code>{target_value}</code>",
         parse_mode="HTML",
     )
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Startup & Main Entrypoint
 # ---------------------------------------------------------------------------
 
+async def post_init(app: Application) -> None:
+    """Initialize DB and run startup health checks."""
+    await db.init()
+    log.info("✓ SQLite Database initialized at %s", config.db_path)
+
+    try:
+        me = await app.bot.get_me()
+        log.info("✓ Telegram Bot: @%s", me.username)
+    except Exception as exc:
+        log.error("✗ Telegram Bot Token error: %s", exc)
+        sys.exit(1)
+
+    log.info("Investor Bot successfully initialized!")
+
+
 def main() -> None:
+    if not config.telegram_token:
+        log.error("TELEGRAM_BOT_TOKEN environment variable is missing!")
+        sys.exit(1)
+
     app = (
         Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(startup_checks)
+        .token(config.telegram_token)
+        .post_init(post_init)
         .build()
     )
 
-    # Channel-only commands
-    for name, handler in [
-        ("current", cmd_current),
-        ("swing", cmd_swing),
-        ("top1m", cmd_top1m),
-        ("top1y", cmd_top1y),
-        ("ath", cmd_ath),
+    # Command Handlers
+    commands = [
+        ("p", cmd_price),
+        ("price", cmd_price),
+        ("fav", cmd_fav),
+        ("watchlist", cmd_watchlist),
         ("alert", cmd_alert),
         ("alerts", cmd_alerts),
         ("delalert", cmd_delalert),
+        ("research", cmd_research),
+        ("market", cmd_market),
         ("about", cmd_about),
-    ]:
+    ]
+
+    for name, handler in commands:
         app.add_handler(CommandHandler(name, handler, filters=CHAT_FILTER))
 
-    # Setup helper — works everywhere
+    # Helper command available everywhere
     app.add_handler(CommandHandler("chatid", cmd_chatid))
 
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(job_spike_check, "interval", minutes=5, args=[app])
-    scheduler.add_job(job_hourly_update, "cron", minute=0, args=[app])
-    scheduler.add_job(job_daily_summary, "cron", hour=0, minute=0, args=[app])
-    scheduler.start()
+    # Start Background Scheduler
+    start_scheduler(app)
 
-    log.info("Bot started. Targets: %s", TARGETS or "none configured")
+    log.info("Starting Investor Telegram Bot...")
     app.run_polling(drop_pending_updates=True)
 
 

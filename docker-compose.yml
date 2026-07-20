@@ -4,4 +4,4 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - ./alerts.json:/app/alerts.json
+      - ./investor_bot.db:/app/investor_bot.db
