@@ -154,27 +154,67 @@ async def job_market_close_alert(app: Application) -> None:
 
 
 async def job_daily_summary(app: Application) -> None:
-    """Daily watchlist movement summary."""
+    """Daily watchlist & portfolio movement summary."""
     for chat_id, thread_id in config.targets:
         try:
-            items = await db.get_watchlist(chat_id)
-            if not items:
+            watchlist_items = await db.get_watchlist(chat_id)
+            portfolio_items = await db.get_portfolio(chat_id)
+
+            if not watchlist_items and not portfolio_items:
                 continue
 
-            lines = []
-            for item in items:
-                try:
-                    q = await fetch_quote(item.symbol, item.asset_type)
-                    icon = "📈" if q.change_24h_pct >= 0 else "📉"
-                    lines.append(f"{icon} <b>{q.symbol}</b> ({q.asset_type.upper()}): {fmt_price(q.price)} ({fmt_pct(q.change_24h_pct)})")
-                except Exception as exc:
-                    lines.append(f"⚠️ <b>{item.symbol}</b>: Error fetching data ({exc})")
-
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            sections = []
+
+            # 1. Watchlist Section
+            if watchlist_items:
+                wl_lines = []
+                for item in watchlist_items:
+                    try:
+                        q = await fetch_quote(item.symbol, item.asset_type)
+                        icon = "📈" if q.change_24h_pct >= 0 else "📉"
+                        wl_lines.append(f"{icon} <b>{q.symbol}</b> ({q.asset_type.upper()}): {fmt_price(q.price)} ({fmt_pct(q.change_24h_pct)})")
+                    except Exception as exc:
+                        wl_lines.append(f"⚠️ <b>{item.symbol}</b>: Error fetching data ({exc})")
+                sections.append("⭐ <b>Watchlist Performance:</b>\n" + "\n".join(wl_lines))
+
+            # 2. Portfolio Section
+            if portfolio_items:
+                port_lines = []
+                total_val = 0.0
+                total_cost = 0.0
+                for p_item in portfolio_items:
+                    try:
+                        q = await fetch_quote(p_item.symbol, p_item.asset_type)
+                        curr_val = q.price * p_item.quantity
+                        cost_basis = p_item.buy_price * p_item.quantity
+                        pnl = curr_val - cost_basis
+                        pnl_pct = ((curr_val - cost_basis) / cost_basis * 100) if cost_basis > 0 else 0.0
+
+                        total_val += curr_val
+                        total_cost += cost_basis
+
+                        pnl_icon = "🟢" if pnl >= 0 else "🔴"
+                        port_lines.append(
+                            f"{pnl_icon} <b>{p_item.symbol}</b>: {fmt_price(curr_val)} (PnL: {pnl:+.2f} / {pnl_pct:+.2f}%) | 24h: {fmt_pct(q.change_24h_pct)}"
+                        )
+                    except Exception as exc:
+                        port_lines.append(f"⚠️ <b>{p_item.symbol}</b>: Fetch error ({exc})")
+
+                total_pnl = total_val - total_cost
+                total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
+                overall_icon = "🟢" if total_pnl >= 0 else "🔴"
+
+                port_header = (
+                    f"💼 <b>Portfolio Status:</b>\n"
+                    f"• Total Value: <b>{fmt_price(total_val)}</b>\n"
+                    f"• Overall PnL: {overall_icon} <b>${total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)</b>\n\n"
+                )
+                sections.append(port_header + "\n".join(port_lines))
+
             text = (
-                f"📊 <b>Daily Investor Digest</b> — {today}\n"
-                f"Here is the daily performance for your watchlist:\n\n"
-                + "\n".join(lines)
+                f"📊 <b>Daily Investor Digest</b> — {today}\n\n"
+                + "\n\n".join(sections)
             )
             await app.bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text, parse_mode="HTML")
         except Exception as exc:

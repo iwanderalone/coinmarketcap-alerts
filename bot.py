@@ -399,6 +399,13 @@ async def cmd_market(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠️ Error checking market status: {exc}")
 
 
+async def cmd_daily(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Trigger daily performance digest on demand."""
+    from services.scheduler import job_daily_summary
+    await update.message.reply_text("⏳ Generating daily digest…")
+    await job_daily_summary(ctx.application)
+
+
 async def handle_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle interactive button clicks."""
     query = update.callback_query
@@ -545,6 +552,7 @@ def main() -> None:
         ("delalert", cmd_delalert),
         ("research", cmd_research),
         ("market", cmd_market),
+        ("daily", cmd_daily),
         ("about", cmd_about),
     ]
 
