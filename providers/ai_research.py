@@ -66,13 +66,16 @@ Do not include markdown headers (# or ##), use HTML bold tags (<b>Section Name</
 
 
 async def _call_gemini(prompt: str) -> str:
-    model = config.ai_model or "gemini-2.5-flash"
+    model = config.ai_model or "gemini-2.0-flash"
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={config.ai_api_key}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload)
+        if resp.status_code == 404 and not config.ai_model:
+            # Fallback to gemini-1.5-flash if 2.0-flash is not found
+            fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={config.ai_api_key}"
+            resp = await client.post(fallback_url, json=payload)
         resp.raise_for_status()
         data = resp.json()
         return data["candidates"][0]["content"]["parts"][0]["text"]
