@@ -67,38 +67,62 @@ Do not include markdown headers (# or ##), use HTML bold tags (<b>Section Name</
 
 
 async def _call_gemini(prompt: str) -> str:
-    # Model cascade list
-    models_to_try = [config.ai_model] if config.ai_model else ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+    # Supported models for Gemini API (free tier)
+    models_to_try = [config.ai_model] if config.ai_model else [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-flash-latest",
+        "gemini-2.5-flash",
+    ]
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     
     last_exc = None
+    retry_delay_sec = 0
+
     async with httpx.AsyncClient(timeout=30) as client:
         for model in models_to_try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={config.ai_api_key}"
             try:
                 resp = await client.post(url, json=payload)
-                if resp.status_code in (404, 429) and len(models_to_try) > 1 and model != models_to_try[-1]:
-                    log.warning("Gemini model %s returned status %d. Trying next model...", model, resp.status_code)
-                    await asyncio.sleep(1)
+                
+                # Handle 429 rate limit: inspect retry delay or try next model
+                if resp.status_code == 429:
+                    log.warning("Gemini model %s hit 429 rate limit.", model)
+                    try:
+                        err_data = resp.json().get("error", {})
+                        for detail in err_data.get("details", []):
+                            if "@type" in detail and "RetryInfo" in detail["@type"]:
+                                delay_str = detail.get("retryDelay", "5s").replace("s", "")
+                                retry_delay_sec = max(5, int(float(delay_str)))
+                    except Exception:
+                        retry_delay_sec = 10
+                    
+                    if len(models_to_try) > 1 and model != models_to_try[-1]:
+                        await asyncio.sleep(1)
+                        continue
+
+                if resp.status_code == 404 and len(models_to_try) > 1 and model != models_to_try[-1]:
+                    log.warning("Gemini model %s 404 not found. Trying next...", model)
                     continue
+
                 resp.raise_for_status()
                 data = resp.json()
                 return data["candidates"][0]["content"]["parts"][0]["text"]
+
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
-                if exc.response.status_code == 429:
-                    log.warning("Gemini rate limit 429 hit for model %s", model)
                 continue
             except Exception as exc:
                 last_exc = exc
                 continue
 
     if isinstance(last_exc, httpx.HTTPStatusError) and last_exc.response.status_code == 429:
+        delay_msg = f" Please retry in ~{retry_delay_sec} seconds." if retry_delay_sec else " Please wait a minute before retrying."
         return (
-            "⚠️ <b>Gemini Free Tier Quota Reached (429 Rate Limit)</b>\n"
-            "Google AI Studio free tier limits the number of requests per minute/day.\n"
-            "<i>Please wait 1 minute before requesting another AI research report!</i>"
+            f"⚠️ <b>Gemini Free Tier Rate Limit Hit (HTTP 429)</b>\n"
+            f"Google AI Studio free tier limits requests per minute.{delay_msg}"
         )
+
     raise last_exc or RuntimeError("All Gemini models failed")
 
 
