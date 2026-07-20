@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import httpx
 from config import config
@@ -66,19 +67,39 @@ Do not include markdown headers (# or ##), use HTML bold tags (<b>Section Name</
 
 
 async def _call_gemini(prompt: str) -> str:
-    model = config.ai_model or "gemini-2.0-flash"
+    # Model cascade list
+    models_to_try = [config.ai_model] if config.ai_model else ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={config.ai_api_key}"
+    last_exc = None
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, json=payload)
-        if resp.status_code == 404 and not config.ai_model:
-            # Fallback to gemini-1.5-flash if 2.0-flash is not found
-            fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={config.ai_api_key}"
-            resp = await client.post(fallback_url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        for model in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={config.ai_api_key}"
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code in (404, 429) and len(models_to_try) > 1 and model != models_to_try[-1]:
+                    log.warning("Gemini model %s returned status %d. Trying next model...", model, resp.status_code)
+                    await asyncio.sleep(1)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                if exc.response.status_code == 429:
+                    log.warning("Gemini rate limit 429 hit for model %s", model)
+                continue
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+    if isinstance(last_exc, httpx.HTTPStatusError) and last_exc.response.status_code == 429:
+        return (
+            "⚠️ <b>Gemini Free Tier Quota Reached (429 Rate Limit)</b>\n"
+            "Google AI Studio free tier limits the number of requests per minute/day.\n"
+            "<i>Please wait 1 minute before requesting another AI research report!</i>"
+        )
+    raise last_exc or RuntimeError("All Gemini models failed")
 
 
 async def _call_openai(prompt: str) -> str:
