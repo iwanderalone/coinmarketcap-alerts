@@ -98,14 +98,26 @@ async def test_database_portfolio(tmp_path):
         symbol="AAPL",
         asset_type="stock",
         quantity=10.0,
-        buy_price=210.5,
+        buy_price=200.0,
     )
     assert item.symbol == "AAPL"
     assert item.quantity == 10.0
 
+    # Add more shares to verify weighted average cost basis calculation
+    item2 = await test_db.add_portfolio_item(
+        chat_id=123,
+        symbol="AAPL",
+        asset_type="stock",
+        quantity=10.0,
+        buy_price=210.0,
+    )
+    assert item2.quantity == 20.0
+    assert item2.buy_price == 205.0
+
     port = await test_db.get_portfolio(123)
     assert len(port) == 1
-    assert port[0].buy_price == 210.5
+    assert port[0].quantity == 20.0
+    assert port[0].buy_price == 205.0
 
     removed = await test_db.remove_portfolio_item(123, "AAPL")
     assert removed is True

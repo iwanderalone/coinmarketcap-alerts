@@ -220,20 +220,48 @@ class Database:
     async def add_portfolio_item(self, chat_id: int, symbol: str, asset_type: str, quantity: float, buy_price: float) -> PortfolioItem:
         symbol_upper = symbol.strip().upper()
         now_str = datetime.now(timezone.utc).isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                "INSERT INTO portfolios (chat_id, symbol, asset_type, quantity, buy_price, added_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(chat_id, symbol) DO UPDATE SET quantity = ?, buy_price = ?, added_at = ?",
-                (chat_id, symbol_upper, asset_type, quantity, buy_price, now_str, quantity, buy_price, now_str),
-            )
-            await db.commit()
+        
+        async with aiosqlite.connect(self.db_path) as db_conn:
+            db_conn.row_factory = aiosqlite.Row
+            # Check for existing holding
+            async with db_conn.execute(
+                "SELECT quantity, buy_price FROM portfolios WHERE chat_id = ? AND symbol = ?",
+                (chat_id, symbol_upper),
+            ) as cursor:
+                existing = await cursor.fetchone()
+
+            if existing:
+                old_qty = float(existing["quantity"])
+                old_price = float(existing["buy_price"])
+                total_qty = old_qty + quantity
+                
+                if total_qty > 0:
+                    avg_price = ((old_qty * old_price) + (quantity * buy_price)) / total_qty
+                else:
+                    avg_price = 0.0
+                
+                await db_conn.execute(
+                    "UPDATE portfolios SET quantity = ?, buy_price = ?, added_at = ? WHERE chat_id = ? AND symbol = ?",
+                    (total_qty, avg_price, now_str, chat_id, symbol_upper),
+                )
+                final_qty = total_qty
+                final_price = avg_price
+            else:
+                await db_conn.execute(
+                    "INSERT INTO portfolios (chat_id, symbol, asset_type, quantity, buy_price, added_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (chat_id, symbol_upper, asset_type, quantity, buy_price, now_str),
+                )
+                final_qty = quantity
+                final_price = buy_price
+                
+            await db_conn.commit()
+            
             return PortfolioItem(
                 chat_id=chat_id,
                 symbol=symbol_upper,
                 asset_type=asset_type,
-                quantity=quantity,
-                buy_price=buy_price,
+                quantity=final_qty,
+                buy_price=final_price,
                 added_at=now_str,
             )
 
