@@ -1,8 +1,21 @@
 import logging
 import sys
 from datetime import datetime
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, filters
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from config import config
 from database import db
@@ -23,6 +36,39 @@ else:
     CHAT_FILTER = ~filters.ChatType.PRIVATE
 
 
+def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Bottom persistent keyboard for one-tap actions."""
+    keyboard = [
+        ["💼 Мой портфель", "🔄 Синхронизация IBKR"],
+        ["🏛️ Рынок США", "⭐ Избранное"],
+        ["📊 Дневной отчет", "❓ Меню и команды"],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Inline menu dashboard with one-tap action buttons."""
+    keyboard = [
+        [
+            InlineKeyboardButton("💼 Мой портфель", callback_data="menu:port"),
+            InlineKeyboardButton("🔄 Синхронизация IBKR", callback_data="port_sync_ibkr"),
+        ],
+        [
+            InlineKeyboardButton("🏛️ Рынок США", callback_data="menu:market"),
+            InlineKeyboardButton("⭐ Избранное", callback_data="menu:watchlist"),
+        ],
+        [
+            InlineKeyboardButton("📊 Дневной отчет", callback_data="menu:daily"),
+            InlineKeyboardButton("🎯 Мои алерты", callback_data="menu:alerts"),
+        ],
+        [
+            InlineKeyboardButton("🏦 Настройки IBKR", callback_data="menu:ibkr"),
+            InlineKeyboardButton("❓ Помощь и справка", callback_data="menu:about"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 def get_quote_keyboard(symbol: str, asset_type: str) -> InlineKeyboardMarkup:
     """Generate interactive buttons for quote response."""
     keyboard = [
@@ -41,6 +87,54 @@ def get_quote_keyboard(symbol: str, asset_type: str) -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 # Command Handlers
 # ---------------------------------------------------------------------------
+
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show interactive control panel with quick action buttons."""
+    text = (
+        "👋 <b>Главная панель инвестора</b>\n\n"
+        "Управляйте активами и следите за рынком в один клик:\n"
+        "• <b>💼 Мой портфель</b> — позиции, стоимость и живой PnL\n"
+        "• <b>🔄 Синхронизация IBKR</b> — обновление акций из брокера\n"
+        "• <b>🏛️ Рынок США</b> — статус NYSE/NASDAQ и индексы\n"
+        "• <b>⭐ Избранное</b> — котировки отслеживаемых активов\n"
+        "• <b>📊 Дневной отчет</b> — сводка дня по портфелю\n\n"
+        "<i>Также кнопки быстрого доступа всегда закреплены внизу экрана 👇</i>"
+    )
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=get_main_menu_keyboard(),
+    )
+    try:
+        await update.message.reply_text(
+            "🎛️ <i>Кнопки быстрого доступа активны внизу экрана:</i>",
+            parse_mode="HTML",
+            reply_markup=get_main_reply_keyboard(),
+        )
+    except Exception:
+        pass
+
+
+async def handle_text_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle bottom reply keyboard button clicks."""
+    text = update.message.text.strip()
+    chat_id = update.effective_chat.id
+
+    if text in ("💼 Мой портфель", "💼 портфель", "портфель"):
+        msg = await update.message.reply_text("⏳ Расчет доходности портфеля…")
+        out_text, reply_markup = await render_portfolio_content(chat_id)
+        await msg.edit_text(out_text, parse_mode="HTML", reply_markup=reply_markup)
+    elif text in ("🔄 Синхронизация IBKR", "🔄 обновить ibkr", "синхронизация"):
+        await handle_ibkr_sync(update, chat_id)
+    elif text in ("🏛️ Рынок США", "рынок сша", "рынок"):
+        await cmd_market(update, ctx)
+    elif text in ("⭐ Избранное", "избранное"):
+        await cmd_watchlist(update, ctx)
+    elif text in ("📊 Дневной отчет", "дневной отчет", "отчет"):
+        await cmd_daily(update, ctx)
+    elif text in ("❓ Меню и команды", "❓ помощь", "помощь", "меню"):
+        await cmd_menu(update, ctx)
+
 
 async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Get price quote for any crypto or stock symbol. Usage: /p AAPL or /p BTC"""
@@ -638,6 +732,60 @@ async def handle_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         except Exception:
             pass
 
+    elif action == "menu":
+        sub = parts[1]
+        if sub == "port":
+            await query.answer("Загрузка портфеля...")
+            out_text, reply_markup = await render_portfolio_content(chat_id)
+            await query.message.reply_text(out_text, parse_mode="HTML", reply_markup=reply_markup)
+        elif sub == "market":
+            await query.answer()
+            status = await fetch_market_status()
+            status_emoji = "🟢" if status.is_open else "🔴"
+            sp_line = f"• S&P 500: <b>{status.sp500_price:,.2f}</b> ({fmt_pct(status.sp500_change_pct or 0.0)})" if status.sp500_price else ""
+            nasdaq_line = f"• Nasdaq: <b>{status.nasdaq_price:,.2f}</b> ({fmt_pct(status.nasdaq_change_pct or 0.0)})" if status.nasdaq_price else ""
+            text = (
+                f"🏛️ <b>US Stock Market Status</b>\n"
+                f"Status: {status_emoji} <b>{status.status_text}</b>\n\n"
+                f"<b>Major Indices:</b>\n"
+                f"{sp_line}\n"
+                f"{nasdaq_line}"
+            )
+            await query.message.reply_text(text, parse_mode="HTML")
+        elif sub == "watchlist":
+            await query.answer()
+            items = await db.get_watchlist(chat_id)
+            if not items:
+                await query.message.reply_text("⭐ <b>Your Watchlist is empty.</b>\nAdd assets using: <code>/fav add stock AAPL</code>", parse_mode="HTML")
+            else:
+                lines = []
+                for it in items:
+                    try:
+                        q = await fetch_quote(it.symbol, it.asset_type)
+                        icon = "📈" if q.change_24h_pct >= 0 else "📉"
+                        lines.append(f"{icon} <b>{q.name} ({q.symbol})</b> [{q.asset_type.upper()}]: <b>{fmt_price(q.price)}</b> ({fmt_pct(q.change_24h_pct)})")
+                    except Exception as exc:
+                        lines.append(f"⚠️ <b>{it.symbol}</b>: Error ({exc})")
+                await query.message.reply_text("⭐ <b>Live Watchlist:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
+        elif sub == "daily":
+            await query.answer("Генерация отчета...")
+            from services.scheduler import job_daily_summary
+            await job_daily_summary(ctx.application)
+        elif sub == "alerts":
+            await query.answer()
+            alerts = await db.get_alerts_for_chat(chat_id)
+            if not alerts:
+                await query.message.reply_text("🎯 <b>No active price alerts.</b>\nSet with <code>/alert &lt;symbol&gt; &lt;price&gt;</code>", parse_mode="HTML")
+            else:
+                lines = [f"• <b>{a.symbol}</b>: {a.direction} {fmt_price(a.target_price)}" for a in alerts]
+                await query.message.reply_text("🎯 <b>Active Price Alerts:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
+        elif sub == "ibkr":
+            await query.answer()
+            await cmd_ibkr(update, ctx)
+        elif sub == "about":
+            await query.answer()
+            await cmd_about(update, ctx)
+
 
 async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show bot features and user command guide."""
@@ -704,9 +852,24 @@ async def post_init(app: Application) -> None:
     try:
         me = await app.bot.get_me()
         log.info("✓ Telegram Bot: @%s", me.username)
+
+        # Register official menu commands in Telegram UI
+        bot_commands = [
+            BotCommand("menu", "🎛️ Главное меню с кнопками"),
+            BotCommand("port", "💼 Мой портфель и живой PnL"),
+            BotCommand("ibkr", "🏦 Синхронизация с Interactive Brokers"),
+            BotCommand("market", "🏛️ Статус рынка США (NYSE/NASDAQ)"),
+            BotCommand("watchlist", "⭐ Избранные акции и крипта"),
+            BotCommand("daily", "📊 Сводный отчет за день"),
+            BotCommand("p", "📊 Цена акции или крипты (/p AAPL)"),
+            BotCommand("news", "📰 Финансовые новости и AI-выжимка"),
+            BotCommand("research", "🤖 AI фундаментальный анализ"),
+            BotCommand("about", "❓ Справка по всем командам"),
+        ]
+        await app.bot.set_my_commands(bot_commands)
+        log.info("✓ Telegram Bot commands menu successfully registered")
     except Exception as exc:
-        log.error("✗ Telegram Bot Token error: %s", exc)
-        sys.exit(1)
+        log.warning("Telegram Bot command registration warning: %s", exc)
 
     log.info("Investor Bot successfully initialized!")
 
@@ -725,6 +888,8 @@ def main() -> None:
 
     # Command Handlers
     commands = [
+        ("start", cmd_menu),
+        ("menu", cmd_menu),
         ("p", cmd_price),
         ("price", cmd_price),
         ("fav", cmd_fav),
@@ -748,6 +913,9 @@ def main() -> None:
     # Helper command & Callback Query Handler for Interactive Buttons
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Bottom Reply Keyboard button clicks handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & CHAT_FILTER, handle_text_buttons))
 
     # Start Background Scheduler
     start_scheduler(app)

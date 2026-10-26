@@ -1,7 +1,8 @@
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 
 from config import config
@@ -29,7 +30,12 @@ def fmt_pct(pct: float) -> str:
     return f"{arrow} {abs(pct):.2f}%"
 
 
-async def broadcast_to_targets(app: Application, text: str, target_chat_id: int = None) -> None:
+async def broadcast_to_targets(
+    app: Application,
+    text: str,
+    target_chat_id: int = None,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> None:
     targets = config.targets
     for chat_id, thread_id in targets:
         if target_chat_id is not None and chat_id != target_chat_id:
@@ -40,6 +46,7 @@ async def broadcast_to_targets(app: Application, text: str, target_chat_id: int 
                 message_thread_id=thread_id,
                 text=text,
                 parse_mode="HTML",
+                reply_markup=reply_markup,
             )
         except Exception as exc:
             log.warning("Broadcast failed → chat %s thread %s: %s", chat_id, thread_id, exc)
@@ -115,39 +122,120 @@ async def job_check_price_alerts_and_spikes(app: Application) -> None:
             log.warning("Failed spike check for %s: %s", item.symbol, exc)
 
 
+async def build_market_session_alert(chat_id: int, is_open: bool) -> tuple[str, InlineKeyboardMarkup]:
+    """Generate session open/close report with market indices, auto-synced IBKR portfolio & Abu Dhabi time."""
+    now_gst = datetime.now(timezone(timedelta(hours=4)))
+    time_gst_str = now_gst.strftime("%H:%M GST")
+
+    # 1. Sync IBKR if configured
+    cfg = await db.get_ibkr_config(chat_id)
+    ibkr_synced = False
+    if cfg:
+        try:
+            from providers.ibkr import fetch_ibkr_positions
+            positions = await fetch_ibkr_positions(cfg["token"], cfg["query_id"])
+            await db.sync_ibkr_portfolio(chat_id, positions, replace_stocks=True)
+            ibkr_synced = True
+        except Exception as exc:
+            log.warning("Scheduled IBKR sync failed for chat %s: %s", chat_id, exc)
+
+    # 2. Market indices
+    status = await fetch_market_status()
+    sp_line = f"• S&P 500: <b>{status.sp500_price:,.2f}</b> ({fmt_pct(status.sp500_change_pct or 0.0)})" if status.sp500_price else ""
+    nasdaq_line = f"• Nasdaq: <b>{status.nasdaq_price:,.2f}</b> ({fmt_pct(status.nasdaq_change_pct or 0.0)})" if status.nasdaq_price else ""
+
+    session_title = "Рынок США открылся! (Market Open)" if is_open else "Рынок США закрылся! (Market Close)"
+    bell_desc = "NYSE & NASDAQ начали торги." if is_open else "Торговая сессия в США завершена."
+
+    lines = [
+        f"🔔 <b>{session_title}</b>",
+        f"⏰ <b>{time_gst_str} (Абу-Даби)</b> • {bell_desc}\n",
+        "🏛️ <b>Индексы США:</b>",
+    ]
+    if sp_line:
+        lines.append(sp_line)
+    if nasdaq_line:
+        lines.append(nasdaq_line)
+
+    # 3. Portfolio section
+    portfolio_items = await db.get_portfolio(chat_id)
+    if portfolio_items:
+        total_val = 0.0
+        total_cost = 0.0
+        holding_lines = []
+        for p_item in portfolio_items:
+            try:
+                q = await fetch_quote(p_item.symbol, p_item.asset_type)
+                curr_val = q.price * p_item.quantity
+                cost_basis = p_item.buy_price * p_item.quantity
+                pnl = curr_val - cost_basis
+                pnl_pct = ((curr_val - cost_basis) / cost_basis * 100) if cost_basis > 0 else 0.0
+
+                total_val += curr_val
+                total_cost += cost_basis
+
+                pnl_icon = "🟢" if pnl >= 0 else "🔴"
+                holding_lines.append(
+                    f"  {pnl_icon} <b>{p_item.symbol}</b> ({p_item.quantity:g}): <b>{fmt_price(curr_val)}</b> "
+                    f"(PnL: {pnl:+.2f} / {pnl_pct:+.2f}%)"
+                )
+            except Exception as exc:
+                holding_lines.append(f"  ⚠️ <b>{p_item.symbol}</b>: Error ({exc})")
+
+        total_pnl = total_val - total_cost
+        total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
+        overall_icon = "🟢" if total_pnl >= 0 else "🔴"
+
+        sync_label = " • <i>IBKR синхронизирован ✅</i>" if ibkr_synced else ""
+        timing_label = "на открытие" if is_open else "по итогам дня"
+
+        lines.append(f"\n💼 <b>Ваш портфель {timing_label}:{sync_label}</b>")
+        lines.append(f"• Стоимость: <b>{fmt_price(total_val)}</b>")
+        lines.append(f"• Итоговый PnL: {overall_icon} <b>${total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)</b>")
+        lines.extend(holding_lines)
+
+    keyboard = [
+        [
+            InlineKeyboardButton("💼 Мой портфель", callback_data="menu:port"),
+            InlineKeyboardButton("🔄 Обновить IBKR", callback_data="port_sync_ibkr"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    return "\n".join(lines), reply_markup
+
+
 async def job_market_open_alert(app: Application) -> None:
-    """Notify when US Stock Market opens (Mon-Fri 09:30 ET)."""
+    """Notify when US Stock Market opens (Mon-Fri 09:30 ET / 17:30 or 18:30 GST Abu Dhabi)."""
     try:
-        status = await fetch_market_status()
-        text = (
-            f"🔔 <b>US Stock Market Open!</b>\n"
-            f"NYSE & NASDAQ are now open for trading.\n"
-        )
-        if status.sp500_price:
-            text += f"• S&P 500: <b>{status.sp500_price:,.2f}</b> ({fmt_pct(status.sp500_change_pct or 0.0)})\n"
-        if status.nasdaq_price:
-            text += f"• Nasdaq: <b>{status.nasdaq_price:,.2f}</b> ({fmt_pct(status.nasdaq_change_pct or 0.0)})\n"
-        
-        await broadcast_to_targets(app, text)
+        targets = config.targets
+        for chat_id, thread_id in targets:
+            text, reply_markup = await build_market_session_alert(chat_id, is_open=True)
+            await app.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
         log.info("US Market Open alert broadcasted.")
     except Exception as exc:
         log.error("Failed US market open alert: %s", exc)
 
 
 async def job_market_close_alert(app: Application) -> None:
-    """Notify when US Stock Market closes (Mon-Fri 16:00 ET)."""
+    """Notify when US Stock Market closes (Mon-Fri 16:00 ET / 00:00 or 01:00 GST Abu Dhabi)."""
     try:
-        status = await fetch_market_status()
-        text = (
-            f"🔔 <b>US Stock Market Closed!</b>\n"
-            f"Trading has concluded for today.\n"
-        )
-        if status.sp500_price:
-            text += f"• S&P 500: <b>{status.sp500_price:,.2f}</b> ({fmt_pct(status.sp500_change_pct or 0.0)})\n"
-        if status.nasdaq_price:
-            text += f"• Nasdaq: <b>{status.nasdaq_price:,.2f}</b> ({fmt_pct(status.nasdaq_change_pct or 0.0)})\n"
-
-        await broadcast_to_targets(app, text)
+        targets = config.targets
+        for chat_id, thread_id in targets:
+            text, reply_markup = await build_market_session_alert(chat_id, is_open=False)
+            await app.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
         log.info("US Market Close alert broadcasted.")
     except Exception as exc:
         log.error("Failed US market close alert: %s", exc)
