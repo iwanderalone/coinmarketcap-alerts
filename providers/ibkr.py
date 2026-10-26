@@ -7,8 +7,8 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-IBKR_SEND_REQUEST_URL = "https://gdcdp.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest"
-IBKR_GET_STATEMENT_URL = "https://gdcdp.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement"
+IBKR_SEND_REQUEST_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest"
+IBKR_GET_STATEMENT_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (compatible; MarketInvestorBot/1.0; +https://github.com/iwanderalone/coinmarketcap-alerts)"
 
 
@@ -192,13 +192,16 @@ async def fetch_ibkr_statement(
         if not ref_code:
             raise ValueError("IBKR response did not include a ReferenceCode.")
 
+        # Use statement URL provided in SendRequest response or fallback
+        statement_url = root.findtext("Url") or root.findtext("url") or IBKR_GET_STATEMENT_URL
+
         # Step 2: Poll for statement
         for attempt in range(max_retries):
             # IBKR generation takes a few seconds, wait before check
             await asyncio.sleep(retry_delay)
 
             poll_params = {"q": ref_code, "t": token_clean, "v": "3"}
-            poll_resp = await client.get(IBKR_GET_STATEMENT_URL, params=poll_params)
+            poll_resp = await client.get(statement_url, params=poll_params)
             poll_resp.raise_for_status()
 
             # Check if still generating (code 1019) or error
