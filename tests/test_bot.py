@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import config, parse_targets
 from database import Database, WatchlistItem, PriceAlert
 from providers.base import Quote
-from services.scheduler import fmt_pct, fmt_price
+from services.scheduler import fmt_pct, fmt_price, send_message_with_retries
 
 
 def test_fmt_price():
@@ -122,3 +122,24 @@ async def test_database_portfolio(tmp_path):
     removed = await test_db.remove_portfolio_item(123, "AAPL")
     assert removed is True
     assert len(await test_db.get_portfolio(123)) == 0
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_retries_recovers():
+    bot = AsyncMock()
+    # Fail first call with ConnectError, succeed on second call
+    bot.send_message.side_effect = [Exception("ConnectError"), MagicMock(message_id=123)]
+
+    success = await send_message_with_retries(bot, chat_id=123, text="Hello", max_retries=2, delay=0.01)
+    assert success is True
+    assert bot.send_message.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_retries_exhausted():
+    bot = AsyncMock()
+    bot.send_message.side_effect = Exception("Permanent failure")
+
+    success = await send_message_with_retries(bot, chat_id=123, text="Hello", max_retries=2, delay=0.01)
+    assert success is False
+    assert bot.send_message.call_count == 2

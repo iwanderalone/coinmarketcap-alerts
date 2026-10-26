@@ -16,6 +16,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from config import config
 from database import db
@@ -879,9 +880,18 @@ def main() -> None:
         log.error("TELEGRAM_BOT_TOKEN environment variable is missing!")
         sys.exit(1)
 
+    request = HTTPXRequest(
+        connection_pool_size=16,
+        connect_timeout=15.0,
+        read_timeout=20.0,
+        write_timeout=15.0,
+        pool_timeout=5.0,
+    )
+
     app = (
         Application.builder()
         .token(config.telegram_token)
+        .request(request)
         .post_init(post_init)
         .build()
     )

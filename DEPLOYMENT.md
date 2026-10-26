@@ -102,3 +102,17 @@ ssh hz-hmg "cd /opt/coinmarket-alerts && docker compose restart"
   /port del СИМВОЛ
   /port add crypto СИМВОЛ КОЛИЧЕСТВО ЦЕНА_ПОКУПКИ
   ```
+
+---
+
+## 5. Отказоустойчивость и сетевые ретраи (Resilience & Retries)
+
+- **Ретраи отправки сообщений (`send_message_with_retries`)**:
+  - Все шедулерные задачи (`job_market_open_alert`, `job_market_close_alert`, `job_daily_summary`, `broadcast_to_targets`) обёрнуты в механизм повторных попыток с экспоненциальной задержкой (до 3 попыток: 2s, 4s, 8s).
+  - Кратковременные сетевые сбои (socket reset, `httpx.ConnectError`, `telegram.error.NetworkError`) больше не приводят к тихому пропуску нотификаций открытия/закрытия торгов.
+- **Таймауты и пул соединений Telegram (`HTTPXRequest`)**:
+  - `connection_pool_size=16`, `connect_timeout=15.0s`, `read_timeout=20.0s`, `write_timeout=15.0s`, `pool_timeout=5.0s`.
+  - Защищает от зависания и сброса keep-alive соединений между VPS Hetzner и серверами Telegram.
+- **Изоляция сбоев внешних провайдеров (`build_market_session_alert`)**:
+  - Сбои IBKR API или временная недоступность Yahoo Finance / CoinGecko не блокируют отправку отчета: бот отобразит доступные данные и отметит недоступные активы плашкой `⚠️ Error`.
+

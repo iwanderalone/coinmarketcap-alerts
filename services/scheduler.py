@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
@@ -30,6 +31,39 @@ def fmt_pct(pct: float) -> str:
     return f"{arrow} {abs(pct):.2f}%"
 
 
+async def send_message_with_retries(
+    bot,
+    chat_id: int,
+    text: str,
+    message_thread_id: Optional[int] = None,
+    parse_mode: str = "HTML",
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    max_retries: int = 3,
+    delay: float = 2.0,
+) -> bool:
+    """Send a telegram message with retry backoff against transient network or Telegram API errors."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            return True
+        except Exception as exc:
+            log.warning(
+                "Attempt %d/%d to send message to chat %s failed: %s",
+                attempt, max_retries, chat_id, exc
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(delay * attempt)
+            else:
+                log.error("Failed to send message to chat %s after %d attempts: %s", chat_id, max_retries, exc)
+                return False
+
+
 async def broadcast_to_targets(
     app: Application,
     text: str,
@@ -41,7 +75,8 @@ async def broadcast_to_targets(
         if target_chat_id is not None and chat_id != target_chat_id:
             continue
         try:
-            await app.bot.send_message(
+            await send_message_with_retries(
+                app.bot,
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 text=text,
@@ -140,9 +175,16 @@ async def build_market_session_alert(chat_id: int, is_open: bool) -> tuple[str, 
             log.warning("Scheduled IBKR sync failed for chat %s: %s", chat_id, exc)
 
     # 2. Market indices
-    status = await fetch_market_status()
-    sp_line = f"• S&P 500: <b>{status.sp500_price:,.2f}</b> ({fmt_pct(status.sp500_change_pct or 0.0)})" if status.sp500_price else ""
-    nasdaq_line = f"• Nasdaq: <b>{status.nasdaq_price:,.2f}</b> ({fmt_pct(status.nasdaq_change_pct or 0.0)})" if status.nasdaq_price else ""
+    sp_line = ""
+    nasdaq_line = ""
+    try:
+        status = await fetch_market_status()
+        if status.sp500_price:
+            sp_line = f"• S&P 500: <b>{status.sp500_price:,.2f}</b> ({fmt_pct(status.sp500_change_pct or 0.0)})"
+        if status.nasdaq_price:
+            nasdaq_line = f"• Nasdaq: <b>{status.nasdaq_price:,.2f}</b> ({fmt_pct(status.nasdaq_change_pct or 0.0)})"
+    except Exception as exc:
+        log.warning("Could not fetch market indices for session alert: %s", exc)
 
     session_title = "Рынок США открылся! (Market Open)" if is_open else "Рынок США закрылся! (Market Close)"
     bell_desc = "NYSE & NASDAQ начали торги." if is_open else "Торговая сессия в США завершена."
@@ -207,38 +249,42 @@ async def build_market_session_alert(chat_id: int, is_open: bool) -> tuple[str, 
 
 async def job_market_open_alert(app: Application) -> None:
     """Notify when US Stock Market opens (Mon-Fri 09:30 ET / 17:30 or 18:30 GST Abu Dhabi)."""
-    try:
-        targets = config.targets
-        for chat_id, thread_id in targets:
+    targets = config.targets
+    for chat_id, thread_id in targets:
+        try:
             text, reply_markup = await build_market_session_alert(chat_id, is_open=True)
-            await app.bot.send_message(
+            sent = await send_message_with_retries(
+                app.bot,
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 text=text,
                 parse_mode="HTML",
                 reply_markup=reply_markup,
             )
-        log.info("US Market Open alert broadcasted.")
-    except Exception as exc:
-        log.error("Failed US market open alert: %s", exc)
+            if sent:
+                log.info("US Market Open alert broadcasted to %s (thread: %s)", chat_id, thread_id)
+        except Exception as exc:
+            log.error("Failed US market open alert for chat %s: %s", chat_id, exc)
 
 
 async def job_market_close_alert(app: Application) -> None:
     """Notify when US Stock Market closes (Mon-Fri 16:00 ET / 00:00 or 01:00 GST Abu Dhabi)."""
-    try:
-        targets = config.targets
-        for chat_id, thread_id in targets:
+    targets = config.targets
+    for chat_id, thread_id in targets:
+        try:
             text, reply_markup = await build_market_session_alert(chat_id, is_open=False)
-            await app.bot.send_message(
+            sent = await send_message_with_retries(
+                app.bot,
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 text=text,
                 parse_mode="HTML",
                 reply_markup=reply_markup,
             )
-        log.info("US Market Close alert broadcasted.")
-    except Exception as exc:
-        log.error("Failed US market close alert: %s", exc)
+            if sent:
+                log.info("US Market Close alert broadcasted to %s (thread: %s)", chat_id, thread_id)
+        except Exception as exc:
+            log.error("Failed US market close alert for chat %s: %s", chat_id, exc)
 
 
 async def job_daily_summary(app: Application) -> None:
@@ -304,7 +350,13 @@ async def job_daily_summary(app: Application) -> None:
                 f"📊 <b>Daily Investor Digest</b> — {today}\n\n"
                 + "\n\n".join(sections)
             )
-            await app.bot.send_message(chat_id=chat_id, message_thread_id=thread_id, text=text, parse_mode="HTML")
+            await send_message_with_retries(
+                app.bot,
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text=text,
+                parse_mode="HTML",
+            )
         except Exception as exc:
             log.error("Failed to send daily summary for chat %s: %s", chat_id, exc)
 
