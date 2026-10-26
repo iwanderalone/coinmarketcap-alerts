@@ -38,6 +38,10 @@ class Config:
     # DB Setting
     db_path: Path = field(default_factory=lambda: Path(os.environ.get("DATABASE_PATH", "investor_bot.db")))
 
+    # Interactive Brokers (IBKR) Flex Web Service Settings
+    ibkr_flex_token: str = field(default_factory=lambda: os.environ.get("IBKR_FLEX_TOKEN", "").strip())
+    ibkr_flex_query_id: str = field(default_factory=lambda: os.environ.get("IBKR_FLEX_QUERY_ID", "").strip())
+
     @property
     def targets(self) -> list[tuple[int, int | None]]:
         return parse_targets(self.target_chat_raw)

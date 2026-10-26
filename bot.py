@@ -1,11 +1,13 @@
 import logging
 import sys
+from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, filters
 
 from config import config
 from database import db
 from providers.ai_research import generate_ai_research
+from providers.ibkr import fetch_ibkr_positions
 from providers.news import fetch_news_items, generate_ai_news_summary
 from providers.stocks import fetch_market_status
 from services.market_service import fetch_quote
@@ -157,13 +159,128 @@ async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.edit_text("⭐ <b>Live Watchlist Summary:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
 
+async def render_portfolio_content(chat_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Calculate and render HTML summary of investor portfolio with interactive buttons."""
+    items = await db.get_portfolio(chat_id)
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 Sync IBKR", callback_data="port_sync_ibkr"),
+            InlineKeyboardButton("💼 Refresh", callback_data="port_refresh"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if not items:
+        text = (
+            "💼 <b>Your Portfolio is empty.</b>\n\n"
+            "• Connect Interactive Brokers: <code>/ibkr</code> or <code>/port sync</code>\n"
+            "• Or add manually:\n"
+            "<code>/port add stock AAPL 10 210.50</code>\n"
+            "<code>/port add crypto BTC 0.5 65000</code>"
+        )
+        return text, reply_markup
+
+    total_val = 0.0
+    total_cost = 0.0
+    lines = []
+
+    for item in items:
+        try:
+            q = await fetch_quote(item.symbol, item.asset_type)
+            curr_val = q.price * item.quantity
+            cost_basis = item.buy_price * item.quantity
+            pnl = curr_val - cost_basis
+            pnl_pct = ((curr_val - cost_basis) / cost_basis * 100) if cost_basis > 0 else 0.0
+
+            total_val += curr_val
+            total_cost += cost_basis
+
+            pnl_icon = "🟢" if pnl >= 0 else "🔴"
+            lines.append(
+                f"{pnl_icon} <b>{item.symbol}</b> ({item.quantity:g} shares/coins)\n"
+                f"   Value: <b>{fmt_price(curr_val)}</b> | PnL: <b>{pnl:+.2f} ({pnl_pct:+.2f}%)</b>\n"
+                f"   Avg Cost: {fmt_price(item.buy_price)} → Now: {fmt_price(q.price)}"
+            )
+        except Exception as exc:
+            lines.append(f"⚠️ <b>{item.symbol}</b>: Error fetching data ({exc})")
+
+    total_pnl = total_val - total_cost
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
+    overall_icon = "🟢" if total_pnl >= 0 else "🔴"
+
+    ibkr_info = ""
+    cfg = await db.get_ibkr_config(chat_id)
+    if cfg and cfg.get("last_synced_at"):
+        try:
+            dt = datetime.fromisoformat(cfg["last_synced_at"])
+            ibkr_info = f" • <i>IBKR: {dt.strftime('%H:%M UTC')}</i>"
+        except Exception:
+            pass
+
+    header = (
+        f"💼 <b>Investor Portfolio Summary</b>{ibkr_info}\n"
+        f"Total Value: <b>{fmt_price(total_val)}</b>\n"
+        f"Total Cost: {fmt_price(total_cost)}\n"
+        f"Total PnL: {overall_icon} <b>${total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)</b>\n\n"
+        f"<b>Holdings Breakdown:</b>\n"
+    )
+
+    return header + "\n\n".join(lines), reply_markup
+
+
+async def handle_ibkr_sync(update: Update, chat_id: int, edit_message=None) -> None:
+    """Execute IBKR Flex Web Service position synchronization."""
+    cfg = await db.get_ibkr_config(chat_id)
+    if not cfg:
+        msg_text = (
+            "⚠️ <b>Interactive Brokers is not configured!</b>\n\n"
+            "To connect your IBKR account via Flex Web Service:\n"
+            "<code>/ibkr config &lt;TOKEN&gt; &lt;QUERY_ID&gt;</code>\n\n"
+            "Or type <code>/ibkr</code> for full step-by-step setup instructions."
+        )
+        if edit_message:
+            await edit_message.reply_text(msg_text, parse_mode="HTML")
+        elif update.message:
+            await update.message.reply_text(msg_text, parse_mode="HTML")
+        return
+
+    progress = None
+    if edit_message:
+        progress = edit_message
+        try:
+            await progress.edit_text("⏳ <i>Connecting to Interactive Brokers & generating Flex Statement…</i>", parse_mode="HTML")
+        except Exception:
+            pass
+    elif update.message:
+        progress = await update.message.reply_text("⏳ <i>Connecting to Interactive Brokers & generating Flex Statement…</i>", parse_mode="HTML")
+
+    try:
+        positions = await fetch_ibkr_positions(cfg["token"], cfg["query_id"])
+        count = await db.sync_ibkr_portfolio(chat_id, positions, replace_stocks=True)
+        text, reply_markup = await render_portfolio_content(chat_id)
+        if progress:
+            await progress.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        elif update.message:
+            await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+    except Exception as exc:
+        err_msg = f"⚠️ <b>IBKR Sync Failed:</b>\n{exc}"
+        if progress:
+            await progress.edit_text(err_msg, parse_mode="HTML")
+        elif update.message:
+            await update.message.reply_text(err_msg, parse_mode="HTML")
+
+
 async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Manage investor portfolio holdings. Usage: /port or /port add <stock|crypto> <symbol> <qty> <buy_price>"""
     chat_id = update.effective_chat.id
 
     if ctx.args:
         subcmd = ctx.args[0].lower()
-        if subcmd == "add":
+        if subcmd in ("sync", "ibkr"):
+            await handle_ibkr_sync(update, chat_id)
+            return
+
+        elif subcmd == "add":
             if len(ctx.args) < 5:
                 await update.message.reply_text("Usage: /port add <stock|crypto> <symbol> <quantity> <buy_price>\nExample: /port add stock AAPL 10 210.50")
                 return
@@ -207,55 +324,96 @@ async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     # View Portfolio
-    items = await db.get_portfolio(chat_id)
-    if not items:
-        await update.message.reply_text(
-            "💼 <b>Your Portfolio is empty.</b>\n"
-            "Add positions using:\n"
-            "<code>/port add stock AAPL 10 210.50</code>\n"
-            "<code>/port add crypto BTC 0.5 65000</code>",
-            parse_mode="HTML",
-        )
+    msg = await update.message.reply_text("⏳ Calculating portfolio performance & PnL…")
+    text, reply_markup = await render_portfolio_content(chat_id)
+    await msg.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+
+
+async def cmd_ibkr(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manage Interactive Brokers (IBKR) Flex Web Service integration."""
+    chat_id = update.effective_chat.id
+
+    if not ctx.args:
+        cfg = await db.get_ibkr_config(chat_id)
+        if cfg:
+            raw_token = cfg["token"]
+            token_masked = raw_token[:4] + "••••" + raw_token[-4:] if len(raw_token) > 8 else "••••••••"
+            last_sync_text = cfg.get("last_synced_at") or "Never"
+            if last_sync_text != "Never":
+                try:
+                    dt = datetime.fromisoformat(last_sync_text)
+                    last_sync_text = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                except Exception:
+                    pass
+            source_text = " (via .env)" if cfg.get("is_env") else ""
+            text = (
+                f"🏦 <b>Interactive Brokers Integration</b>\n\n"
+                f"Status: 🟢 <b>Connected{source_text}</b>\n"
+                f"Query ID: <code>{cfg['query_id']}</code>\n"
+                f"Token: <code>{token_masked}</code>\n"
+                f"Last Synced: <b>{last_sync_text}</b>\n\n"
+                f"<b>Commands:</b>\n"
+                f"• <code>/port sync</code> or <code>/ibkr sync</code> — Sync positions now\n"
+                f"• <code>/ibkr config &lt;token&gt; &lt;query_id&gt;</code> — Update credentials\n"
+                f"• <code>/ibkr unlink</code> — Disconnect custom credentials"
+            )
+            buttons = [
+                [
+                    InlineKeyboardButton("🔄 Sync Now", callback_data="port_sync_ibkr"),
+                    InlineKeyboardButton("💼 View Portfolio", callback_data="port_refresh"),
+                ]
+            ]
+            await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            text = (
+                "🏦 <b>Interactive Brokers Integration (Flex Web Service)</b>\n\n"
+                "Status: ⚪ <b>Not connected</b>\n\n"
+                "<b>How to connect in 3 steps:</b>\n"
+                "1. Log into your IBKR Client Portal\n"
+                "2. Go to: <b>Performance & Reports</b> → <b>Flex Queries</b>\n"
+                "   • In <b>Activity Flex Query</b> create a new query with section <b>Open Positions</b> (Format: XML)\n"
+                "   • In <b>Flex Web Service</b>, enable service & copy your <b>Token</b>\n"
+                "3. Run in this chat:\n"
+                "<code>/ibkr config &lt;TOKEN&gt; &lt;QUERY_ID&gt;</code>\n\n"
+                "<i>After connecting, run <code>/port sync</code> to automatically load all your stock holdings!</i>"
+            )
+            await update.message.reply_text(text, parse_mode="HTML")
         return
 
-    msg = await update.message.reply_text("⏳ Calculating portfolio performance & PnL…")
-    total_val = 0.0
-    total_cost = 0.0
-    lines = []
-
-    for item in items:
+    subcmd = ctx.args[0].lower()
+    if subcmd == "config":
+        if len(ctx.args) < 3:
+            await update.message.reply_text("Usage: <code>/ibkr config &lt;token&gt; &lt;query_id&gt;</code>", parse_mode="HTML")
+            return
+        token = ctx.args[1].strip()
+        query_id = ctx.args[2].strip()
+        status_msg = await update.message.reply_text("⏳ Verifying credentials with Interactive Brokers…")
         try:
-            q = await fetch_quote(item.symbol, item.asset_type)
-            curr_val = q.price * item.quantity
-            cost_basis = item.buy_price * item.quantity
-            pnl = curr_val - cost_basis
-            pnl_pct = ((curr_val - cost_basis) / cost_basis * 100) if cost_basis > 0 else 0.0
-
-            total_val += curr_val
-            total_cost += cost_basis
-
-            pnl_icon = "🟢" if pnl >= 0 else "🔴"
-            lines.append(
-                f"{pnl_icon} <b>{item.symbol}</b> ({item.quantity:g} shares/coins)\n"
-                f"   Value: <b>{fmt_price(curr_val)}</b> | PnL: <b>{pnl:+.2f} ({pnl_pct:+.2f}%)</b>\n"
-                f"   Avg Cost: {fmt_price(item.buy_price)} → Now: {fmt_price(q.price)}"
+            positions = await fetch_ibkr_positions(token, query_id)
+            await db.set_ibkr_config(chat_id, token, query_id)
+            count = await db.sync_ibkr_portfolio(chat_id, positions, replace_stocks=True)
+            await status_msg.edit_text(
+                f"✅ <b>Interactive Brokers Connected!</b>\n"
+                f"Successfully synced <b>{count} positions</b> into your portfolio.\n\n"
+                f"View your holdings anytime with <code>/port</code>.",
+                parse_mode="HTML",
             )
         except Exception as exc:
-            lines.append(f"⚠️ <b>{item.symbol}</b>: Error fetching data ({exc})")
+            await status_msg.edit_text(
+                f"⚠️ <b>IBKR Connection Failed:</b>\n{exc}\n\n"
+                f"Please verify your Token and Query ID in the IBKR Portal.",
+                parse_mode="HTML",
+            )
 
-    total_pnl = total_val - total_cost
-    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
-    overall_icon = "🟢" if total_pnl >= 0 else "🔴"
+    elif subcmd in ("sync", "refresh"):
+        await handle_ibkr_sync(update, chat_id)
 
-    header = (
-        f"💼 <b>Investor Portfolio Summary</b>\n"
-        f"Total Value: <b>{fmt_price(total_val)}</b>\n"
-        f"Total Cost: {fmt_price(total_cost)}\n"
-        f"Total PnL: {overall_icon} <b>${total_pnl:+,.2f} ({total_pnl_pct:+.2f}%)</b>\n\n"
-        f"<b>Holdings Breakdown:</b>\n"
-    )
-
-    await msg.edit_text(header + "\n\n".join(lines), parse_mode="HTML")
+    elif subcmd in ("unlink", "remove", "disconnect"):
+        removed = await db.remove_ibkr_config(chat_id)
+        if removed:
+            await update.message.reply_text("✅ Interactive Brokers configuration removed for this chat.", parse_mode="HTML")
+        else:
+            await update.message.reply_text("⚠️ No custom IBKR configuration was saved for this chat.", parse_mode="HTML")
 
 
 async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -456,6 +614,30 @@ async def handle_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
             parse_mode="HTML",
         )
 
+    elif action == "port_sync_ibkr":
+        cfg = await db.get_ibkr_config(chat_id)
+        if not cfg:
+            await query.answer("IBKR not configured. Use /ibkr to set up.", show_alert=True)
+            await query.message.reply_text(
+                "⚠️ <b>Interactive Brokers is not configured!</b>\n\n"
+                "Connect your account via Flex Web Service:\n"
+                "<code>/ibkr config &lt;TOKEN&gt; &lt;QUERY_ID&gt;</code>\n\n"
+                "Or run <code>/ibkr</code> for full instructions.",
+                parse_mode="HTML",
+            )
+            return
+
+        await query.answer("🔄 Connecting to IBKR...")
+        await handle_ibkr_sync(update, chat_id, edit_message=query.message)
+
+    elif action == "port_refresh":
+        await query.answer("Refreshing portfolio...")
+        text, reply_markup = await render_portfolio_content(chat_id)
+        try:
+            await query.message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        except Exception:
+            pass
+
 
 async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show bot features and user command guide."""
@@ -467,9 +649,12 @@ async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• <code>/market</code> — US stock market status & indices\n"
         "• <code>/watchlist</code> — Live updates for your favorites\n"
         "• <code>/news NVDA</code> — Financial news & AI news summary\n\n"
-        "<b>Portfolio Tracker</b>\n"
+        "<b>Portfolio & Interactive Brokers</b>\n"
         "• <code>/port</code> — View portfolio value, PnL & holdings breakdown\n"
-        "• <code>/port add stock AAPL 10 210.50</code> — Add/update holding\n"
+        "• <code>/port sync</code> — Sync positions directly from Interactive Brokers\n"
+        "• <code>/ibkr</code> — View IBKR connection status & setup guide\n"
+        "• <code>/ibkr config &lt;token&gt; &lt;query_id&gt;</code> — Connect IBKR Flex Web Service\n"
+        "• <code>/port add stock AAPL 10 210.50</code> — Manually add/accumulate holding\n"
         "• <code>/port del AAPL</code> — Remove holding\n\n"
         "<b>Favorites Watchlist</b>\n"
         "• <code>/fav add stock AAPL</code> — Add US stock to favorites\n"
@@ -546,6 +731,7 @@ def main() -> None:
         ("watchlist", cmd_watchlist),
         ("port", cmd_portfolio),
         ("portfolio", cmd_portfolio),
+        ("ibkr", cmd_ibkr),
         ("news", cmd_news),
         ("alert", cmd_alert),
         ("alerts", cmd_alerts),

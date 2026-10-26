@@ -12,7 +12,8 @@ An all-in-one Telegram Bot designed for investors to track **US Stocks** and **C
 - **Drastic Price Movement Alerts**: Instant alerts for sharp price surges or drops across watchlisted assets.
 - **Price Target Alerts**: Set custom threshold alerts (`/alert NVDA 140`).
 - **AI Investor Research Agent (`/research <symbol>`)**: Connect your AI API key (Google Gemini, OpenAI, or Anthropic) to generate automated investor research briefings (executive summary, fundamental drivers, price action, risks).
-- **SQLite Persistence**: Watchlists and target alerts are persisted asynchronously in SQLite (`investor_bot.db`).
+- **Interactive Brokers Integration (Flex Web Service)**: Connect your IBKR brokerage account directly (read-only) to automatically synchronize open positions and cost bases.
+- **SQLite Persistence**: Watchlists, price alerts, portfolios, and IBKR configuration are persisted asynchronously in SQLite (`investor_bot.db`).
 
 ---
 
@@ -21,13 +22,17 @@ An all-in-one Telegram Bot designed for investors to track **US Stocks** and **C
 | Command | Usage Example | Description |
 |---------|---------------|-------------|
 | `/p` or `/price` | `/p AAPL` or `/p BTC` | Real-time price quote & market stats |
+| `/port` or `/portfolio` | `/port`<br>`/port sync`<br>`/port add stock AAPL 10 210`<br>`/port del AAPL` | View portfolio, sync from IBKR, or manage manual holdings |
+| `/ibkr` | `/ibkr`<br>`/ibkr config <TOKEN> <QUERY_ID>`<br>`/ibkr sync`<br>`/ibkr unlink` | Manage Interactive Brokers Flex Web Service integration |
 | `/fav` | `/fav add stock AAPL`<br>`/fav add crypto BTC`<br>`/fav list`<br>`/fav del AAPL` | Manage favorite stocks & crypto |
 | `/watchlist` | `/watchlist` | Live 24h performance summary of your favorites |
 | `/market` | `/market` | Status of US Market (Open/Closed) & major indices |
+| `/news` | `/news NVDA` | Financial news & AI news summary |
 | `/alert` | `/alert NVDA 145` | Set target price alert |
 | `/alerts` | `/alerts` | List all active price alerts |
 | `/delalert` | `/delalert NVDA 145` | Delete a price alert |
 | `/research` | `/research TSLA` | AI-generated investor research briefing |
+| `/daily` | `/daily` | Trigger daily portfolio & market digest on demand |
 | `/about` | `/about` | Display full command list and bot configuration |
 | `/chatid` | `/chatid` | Inspect current Chat ID & topic thread ID |
 
@@ -85,6 +90,8 @@ market-investor-bot/
 │   ├── base.py           # Unified data schemas (Quote, MarketStatus)
 │   ├── crypto.py         # CoinMarketCap & CoinGecko integration
 │   ├── stocks.py         # Yahoo Finance integration & market hours check
+│   ├── ibkr.py           # Interactive Brokers Flex Web Service provider
+│   ├── news.py           # Yahoo Finance & Finviz news provider
 │   └── ai_research.py    # Gemini, OpenAI & Anthropic research provider
 ├── services/             # Core business logic
 │   ├── market_service.py # Unified quote router & auto-detector

@@ -78,6 +78,14 @@ class Database:
                     PRIMARY KEY (chat_id, symbol)
                 )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS ibkr_configs (
+                    chat_id INTEGER PRIMARY KEY,
+                    token TEXT NOT NULL,
+                    query_id TEXT NOT NULL,
+                    last_synced_at TEXT
+                )
+            """)
             await db.commit()
 
         # Migrate legacy alerts.json if exists
@@ -284,6 +292,106 @@ class Database:
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [PortfolioItem(**dict(row)) for row in rows]
+
+    # -------------------------------------------------------------------
+    # Interactive Brokers (IBKR) Methods
+    # -------------------------------------------------------------------
+
+    async def get_ibkr_config(self, chat_id: int) -> Optional[dict]:
+        """Get IBKR config for chat. Falls back to global env variables if configured."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT token, query_id, last_synced_at FROM ibkr_configs WHERE chat_id = ?",
+                (chat_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+
+        # Fallback to .env config if available
+        if config.ibkr_flex_token and config.ibkr_flex_query_id:
+            return {
+                "token": config.ibkr_flex_token,
+                "query_id": config.ibkr_flex_query_id,
+                "last_synced_at": None,
+                "is_env": True,
+            }
+        return None
+
+    async def set_ibkr_config(self, chat_id: int, token: str, query_id: str) -> None:
+        """Store or update IBKR credentials for chat."""
+        token_clean = token.strip()
+        query_id_clean = query_id.strip()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO ibkr_configs (chat_id, token, query_id, last_synced_at)
+                VALUES (?, ?, ?, NULL)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    token = excluded.token,
+                    query_id = excluded.query_id
+                """,
+                (chat_id, token_clean, query_id_clean),
+            )
+            await db.commit()
+
+    async def remove_ibkr_config(self, chat_id: int) -> bool:
+        """Remove IBKR config for chat."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("DELETE FROM ibkr_configs WHERE chat_id = ?", (chat_id,))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def update_ibkr_last_synced(self, chat_id: int, timestamp: Optional[str] = None) -> None:
+        """Update last_synced_at timestamp."""
+        now_str = timestamp or datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE ibkr_configs SET last_synced_at = ? WHERE chat_id = ?",
+                (now_str, chat_id),
+            )
+            await db.commit()
+
+    async def sync_ibkr_portfolio(self, chat_id: int, positions: list, replace_stocks: bool = True) -> int:
+        """
+        Synchronize positions from Interactive Brokers into portfolios table.
+        If replace_stocks=True, existing stock positions for this chat are replaced
+        while preserving any crypto holdings.
+        """
+        now_str = datetime.now(timezone.utc).isoformat()
+        count = 0
+        async with aiosqlite.connect(self.db_path) as db:
+            if replace_stocks:
+                await db.execute("DELETE FROM portfolios WHERE chat_id = ? AND asset_type = 'stock'", (chat_id,))
+
+            for pos in positions:
+                sym = pos.symbol.strip().upper()
+                qty = float(pos.quantity)
+                cost = float(pos.cost_price)
+                asset_type = getattr(pos, "asset_type", "stock")
+
+                await db.execute(
+                    """
+                    INSERT INTO portfolios (chat_id, symbol, asset_type, quantity, buy_price, added_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id, symbol) DO UPDATE SET
+                        quantity = excluded.quantity,
+                        buy_price = excluded.buy_price,
+                        added_at = excluded.added_at
+                    """,
+                    (chat_id, sym, asset_type, qty, cost, now_str),
+                )
+                count += 1
+
+            # Update last_synced_at in ibkr_configs if record exists
+            await db.execute(
+                "UPDATE ibkr_configs SET last_synced_at = ? WHERE chat_id = ?",
+                (now_str, chat_id),
+            )
+            await db.commit()
+
+        return count
 
 
 db = Database()
