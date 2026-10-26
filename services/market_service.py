@@ -8,7 +8,7 @@ log = logging.getLogger(__name__)
 
 # Known crypto symbols for auto-detection
 KNOWN_CRYPTO_SYMBOLS = {
-    "BTC", "ETH", "TON", "SOL", "XRP", "ADA", "DOGE", "BNB", "AVAX",
+    "BTC", "ETH", "TON", "GRAM", "SOL", "XRP", "ADA", "DOGE", "BNB", "AVAX",
     "DOT", "LINK", "NEAR", "SUI", "SHIB", "PEPE", "UNI", "LTC", "APT"
 }
 

@@ -12,6 +12,7 @@ CG_BASE = "https://api.coingecko.com/api/v3"
 # Symbol map for common cryptos to CG ids if needed
 CRYPTO_CG_ID_MAP = {
     "TON": "the-open-network",
+    "GRAM": "the-open-network",
     "BTC": "bitcoin",
     "ETH": "ethereum",
     "SOL": "solana",
